@@ -1096,7 +1096,7 @@ async def add_single_account(
         account.spam_status,
         account.session_string,
         account.two_fa_password,
-        account.price
+        float(account.price)
     )
     
     return {"success": True, "account_id": account_id}
@@ -1211,8 +1211,8 @@ async def set_country_pricing(
         pricing.country_code,
         pricing.country_name,
         pricing.prefix,
-        pricing.base_price,
-        pricing.limited_price
+        float(pricing.base_price),
+        float(pricing.limited_price)
     )
     
     # Update existing accounts prices
@@ -1225,8 +1225,8 @@ async def set_country_pricing(
         END
         WHERE country_code = $3
         """,
-        pricing.base_price,
-        pricing.limited_price,
+        float(pricing.base_price),
+        float(pricing.limited_price),
         pricing.country_code
     )
     
