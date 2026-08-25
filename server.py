@@ -1181,16 +1181,9 @@ async def add_bulk_accounts(
         "updated_count": updated_count,
         "errors": errors
     }
-
 @app.post("/api/admin/pricing")
-async def set_country_pricing(
-    pricing: PricingRequest,
-    api_key: str = Header(..., alias="X-API-Key")
-):
-    """Set country pricing (admin only)"""
+async def set_country_pricing(pricing: PricingRequest, api_key: str = Header(..., alias="X-API-Key")):
     await rate_limit(api_key)
-    
-    # Authenticate admin
     user_data = await authenticate(api_key)
     
     if not user_data['is_admin']:
@@ -1200,13 +1193,13 @@ async def set_country_pricing(
     await Database.execute(
         """
         INSERT INTO country_pricing (country_code, country_name, prefix, base_price, limited_price)
-        VALUES ($1, $2, $3, $4, $5)
+        VALUES ($1, $2, $3, $4::numeric, $5::numeric)
         ON CONFLICT (country_code) 
         DO UPDATE SET 
             country_name = $2,
             prefix = $3,
-            base_price = $4,
-            limited_price = $5
+            base_price = $4::numeric,
+            limited_price = $5::numeric
         """,
         pricing.country_code,
         pricing.country_name,
@@ -1215,13 +1208,13 @@ async def set_country_pricing(
         float(pricing.limited_price)
     )
     
-    # Update existing accounts prices
+    # Update existing accounts prices - FIX HERE
     await Database.execute(
         """
         UPDATE accounts 
         SET price = CASE 
-            WHEN spam_status = 'limited' THEN $2
-            ELSE $1
+            WHEN spam_status = 'limited' THEN $2::numeric
+            ELSE $1::numeric
         END
         WHERE country_code = $3
         """,
