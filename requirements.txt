@@ -1,0 +1,72 @@
+# Core Web Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-dotenv==1.0.0
+
+# Database
+asyncpg==0.29.0
+SQLAlchemy==2.0.23  # Optional: if you want ORM capabilities later
+
+# HTTP Client
+httpx==0.25.1
+
+# Data Validation
+pydantic==2.5.0
+pydantic-settings==2.1.0  # For better config management
+
+# Async Support
+asyncio==3.4.3
+aiofiles==23.2.1  # For async file operations
+
+# Type Checking and Validation
+typing-extensions==4.8.0
+python-multipart==0.0.6  # For form data parsing
+
+# Security
+python-jose[cryptography]==3.3.0  # For JWT tokens (if needed)
+passlib[bcrypt]==1.7.4  # For password hashing (if needed)
+cryptography==41.0.7
+
+# Rate Limiting
+slowapi==0.1.9  # Alternative to custom rate limiting
+
+# Background Tasks
+celery==5.3.4  # Optional: for distributed task queue
+redis==5.0.1  # Optional: for caching and queue
+
+# Monitoring and Logging
+prometheus-client==0.19.0
+python-json-logger==2.0.7
+structlog==23.2.0
+
+# Development and Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+httpx==0.25.1  # For testing
+faker==20.1.0  # For generating test data
+factory-boy==3.3.0  # For test fixtures
+
+# Code Quality
+black==23.11.0
+flake8==6.1.0
+mypy==1.7.0
+isort==5.12.0
+pre-commit==3.5.0
+
+# Documentation
+mkdocs==1.5.3
+mkdocs-material==9.4.8
+
+# Deployment
+gunicorn==21.2.0
+supervisor==4.2.5  # Optional: process management
+
+# Database Migrations
+alembic==1.12.1  # For database migrations
+
+# Utilities
+python-dateutil==2.8.2
+pytz==2023.3
+ujson==5.8.0  # Faster JSON parsing
+orjson==3.9.10  # Fast JSON serialization
