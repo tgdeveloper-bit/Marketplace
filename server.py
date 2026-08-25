@@ -708,7 +708,7 @@ async def purchase_initiate(
             "success": True,
             "transaction_id": transaction['transaction_id'],
             "purchase_code": purchase_code,
-            "phone_number": hide_phone(account['phone_number']),
+            "phone_number": account['phone_number'],
             "price": pricing['price'],
             "otp_timeout": config.OTP_TIMEOUT,
             "reservation_timeout": config.RESERVATION_TIMEOUT,
@@ -1316,6 +1316,65 @@ async def view_stock(
     
     return {"success": True, "stock": list(stock_summary.values())}
 
+@app.get("/api/admin/transaction/{transaction_id}")
+async def get_transaction_details(
+    transaction_id: str,
+    api_key: str = Header(..., alias="X-API-Key")
+):
+    """Get full transaction details including phone number (admin only)"""
+    await rate_limit(api_key)
+    
+    # Authenticate admin
+    user_data = await authenticate(api_key)
+    
+    if not user_data['is_admin']:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    
+    # Get transaction with full account details
+    result = await Database.fetchrow(
+        """
+        SELECT 
+            t.transaction_id,
+            t.user_id,
+            t.user_type,
+            t.amount,
+            t.country_code,
+            t.spam_status,
+            t.purchase_code,
+            t.otp_status,
+            t.otp_attempts,
+            t.status,
+            t.created_at,
+            a.phone_number,  -- ✅ Full number
+            a.country_name,
+            a.prefix
+        FROM transactions t
+        LEFT JOIN accounts a ON t.account_id = a.account_id
+        WHERE t.transaction_id = $1
+        """,
+        transaction_id
+    )
+    
+    if not result:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    
+    return {
+        "success": True,
+        "transaction": {
+            "transaction_id": result['transaction_id'],
+            "user_id": result['user_id'],
+            "amount": float(result['amount']),
+            "country_code": result['country_code'],
+            "country_name": result['country_name'],
+            "spam_status": result['spam_status'],
+            "purchase_code": result['purchase_code'],
+            "otp_status": result['otp_status'],
+            "status": result['status'],
+            "phone_number": result['phone_number'],  # ✅ Full number
+            "prefix": result['prefix'],
+            "created_at": result['created_at'].isoformat()
+        }
+    }
 @app.get("/api/admin/transactions")
 async def view_transactions(
     limit: int = 50,
