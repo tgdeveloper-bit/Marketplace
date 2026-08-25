@@ -31,6 +31,7 @@ class Config:
     MAX_OTP_ATTEMPTS = int(os.getenv("MAX_OTP_ATTEMPTS", "5"))
     MAX_DAILY_RETRIES = int(os.getenv("MAX_DAILY_RETRIES", "5"))
     CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "60"))
+    SUPER_ADMIN_KEY = os.getenv("SUPER_ADMIN_KEY", "super_admin_key_123")
 
 config = Config()
 
@@ -72,7 +73,14 @@ class Database:
         pool = await cls.connect()
         async with pool.acquire() as conn:
             return await conn.execute(query, *args)
-
+            
+class EndpointConfigCreateRequest(BaseModel):
+    endpoint_name: str
+    admin_api_key: str
+    user_api_key: Optional[str] = None
+    bot_token: Optional[str] = None
+    admin_telegram_id: Optional[int] = None
+    channel_username: Optional[str] = None
 # ============ Pydantic Models ============
 class PurchaseInitiateRequest(BaseModel):
     user_identifier: str = Field(..., description="User ID or identifier")
@@ -978,6 +986,41 @@ async def otp_callback(
     else:
         return {"success": False, "message": f"Unknown status: {callback.status}"}
 
+@app.post("/api/admin/endpoint-config")
+async def create_endpoint_config(
+    request: EndpointConfigCreateRequest,
+    api_key: str = Header(..., alias="X-API-Key")
+):
+    """Create or update endpoint configuration (super admin only)"""
+    
+    # Super admin check from env
+    if api_key != Config.SUPER_ADMIN_KEY:
+        raise HTTPException(403, "Super admin access required")
+    
+    await Database.execute(
+        """
+        INSERT INTO endpoint_configs 
+        (endpoint_name, admin_api_key, user_api_key, bot_token, admin_telegram_id, channel_username)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        ON CONFLICT (endpoint_name) 
+        DO UPDATE SET 
+            admin_api_key = $2,
+            user_api_key = $3,
+            bot_token = $4,
+            admin_telegram_id = $5,
+            channel_username = $6,
+            is_active = TRUE
+        """,
+        request.endpoint_name,
+        request.admin_api_key,
+        request.user_api_key,
+        request.bot_token,
+        request.admin_telegram_id,
+        request.channel_username
+    )
+    
+    return {"success": True, "message": f"Endpoint '{request.endpoint_name}' configured"}
+    
 @app.get("/api/otp/servers/health")
 async def check_all_otp_servers(
     internal_api_key: str = Header(..., alias="X-Internal-Key")
