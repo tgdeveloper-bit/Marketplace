@@ -118,7 +118,6 @@ class AccountAddRequest(BaseModel):
     session_string: str
     two_fa_password: str
     price: Optional[float] = None
-    # নতুন ফিল্ড
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     username: Optional[str] = None
