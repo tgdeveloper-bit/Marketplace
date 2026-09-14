@@ -31,8 +31,13 @@ class Config:
     MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", "3"))
     MAX_OTP_ATTEMPTS = int(os.getenv("MAX_OTP_ATTEMPTS", "5"))
     MAX_DAILY_RETRIES = int(os.getenv("MAX_DAILY_RETRIES", "5"))
-    CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "60"))
+    CLEANUP_INTERVAL = int(os.getenv("CLEANUP_INTERVAL", "900"))
     SUPER_ADMIN_KEY = os.getenv("SUPER_ADMIN_KEY", "super_admin_key_123")
+    OTP_RETRY_COOLDOWN_SECONDS = int(os.getenv("OTP_RETRY_COOLDOWN_SECONDS", "30"))
+    MAX_OTP_RETRIES_AFTER_DETECTION = int(os.getenv("MAX_OTP_RETRIES_AFTER_DETECTION", "2"))
+    STRICT_RATE_LIMIT_PER_MINUTE = int(os.getenv("STRICT_RATE_LIMIT_PER_MINUTE", "2"))
+    ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@your_admin_username")
+    PROBLEM_AUTO_EXPIRE_HOURS = int(os.getenv("PROBLEM_AUTO_EXPIRE_HOURS", "24"))
 
 config = Config()
 
@@ -45,7 +50,7 @@ class Database:
         if not cls.pool:
             cls.pool = await asyncpg.create_pool(
                 config.DATABASE_URL,
-                min_size=5,
+                min_size=1,
                 max_size=20,
                 command_timeout=60
             )
@@ -69,6 +74,11 @@ class Database:
         async with pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
+    @classmethod
+    async def fetchval(cls, query: str, *args):
+        pool = await cls.connect()
+        async with pool.acquire() as conn:
+            return await conn.fetchval(query, *args)
     @classmethod
     async def execute(cls, query: str, *args):
         pool = await cls.connect()
@@ -97,10 +107,6 @@ class PurchaseInitiateRequest(BaseModel):
     country_code: str = Field(..., min_length=2, max_length=2)
     spam_status: str = Field(..., pattern="^(good|limited|bad)$")
 
-class PurchaseVerifyRequest(BaseModel):
-    transaction_id: str
-    otp_code: str = Field(..., min_length=4, max_length=10)
-
 class RetryOTPRequest(BaseModel):
     transaction_id: str
     purchase_code: str
@@ -116,7 +122,7 @@ class AccountAddRequest(BaseModel):
     prefix: str
     spam_status: str = Field(..., pattern="^(good|limited|bad)$")
     session_string: str
-    two_fa_password: str
+    two_fa_password: Optional[str] = None
     price: Optional[float] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -180,6 +186,120 @@ app.add_middleware(
 )
 
 # ============ Helper Functions ============
+# ============ NEW: Immediate Balance Deduction ============
+async def deduct_balance_immediately(
+    transaction_id: str, 
+    user_id: str, 
+    user_type: str, 
+    endpoint_name: str, 
+    amount: float
+) -> bool:
+    """
+    Purchase-request-এই balance deduct. 
+    Atomic operation — fail হলে transaction fail হবে.
+    """
+    pool = await Database.connect()   # ✅ Always returns pool (creates if None)
+    async with pool.acquire() as conn:   # ✅ Correct variable
+        async with conn.transaction():
+            # Balance check with row lock
+            user_row = await conn.fetchrow(
+                """
+                SELECT balance FROM users 
+                WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $3
+                FOR UPDATE
+                """,
+                user_id, user_type, endpoint_name
+            )
+            
+            if not user_row:
+                raise HTTPException(status_code=400, detail="User not found. Contact admin.")
+            
+            current_balance = float(user_row['balance'])
+            if current_balance < amount:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Insufficient balance. Required: {amount}, Available: {current_balance}"
+                )
+            
+            # Deduct
+            await conn.execute(
+                """
+                UPDATE users 
+                SET balance = balance - $3, updated_at = NOW()
+                WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $4
+                """,
+                user_id, user_type, amount, endpoint_name
+            )
+            
+            # Mark transaction as deducted
+            await conn.execute(
+                """
+                UPDATE transactions 
+                SET balance_deducted = TRUE 
+                WHERE transaction_id = $1
+                """,
+                transaction_id
+            )
+            
+            return True
+
+# ============ NEW: Strict Rate Limit (Post-Detection) ============
+rate_limit_cache = {}
+
+async def strict_rate_limit(user_id: str, endpoint_name: str):
+    """
+    OTP detect হওয়ার পরে এই user-এর জন্য কড়া rate limit।
+    প্রতি minute-এ মাত্র 2টি request allowed.
+    """
+    key = f"strict:{endpoint_name}:{user_id}"
+    current_time = datetime.now()
+    minute_key = current_time.strftime("%Y%m%d%H%M")
+    
+    if key not in rate_limit_cache:
+        rate_limit_cache[key] = {}
+    
+    if minute_key not in rate_limit_cache[key]:
+        rate_limit_cache[key][minute_key] = 0
+    
+    rate_limit_cache[key][minute_key] += 1
+    
+    if rate_limit_cache[key][minute_key] > config.STRICT_RATE_LIMIT_PER_MINUTE:
+        raise HTTPException(
+            status_code=429, 
+            detail=(
+                f"Strict rate limit exceeded (post-OTP-detection). "
+                f"Max {config.STRICT_RATE_LIMIT_PER_MINUTE} requests/min. "
+                f"Wait and try again."
+            )
+        )
+    
+    # Cleanup
+    if len(rate_limit_cache[key]) > 10:
+        sorted_keys = sorted(rate_limit_cache[key].keys())
+        for old_key in sorted_keys[:-5]:
+            del rate_limit_cache[key][old_key]
+
+
+# ============ NEW: Cooldown Check ============
+async def check_otp_cooldown(transaction_id: str):
+    """
+    Previous OTP request থেকে কমপক্ষে 30 second gap।
+    """
+    tx = await Database.fetchrow(
+        "SELECT last_otp_request_at FROM transactions WHERE transaction_id = $1",
+        transaction_id
+    )
+    if not tx or not tx['last_otp_request_at']:
+        return
+    
+    elapsed = (datetime.now() - tx['last_otp_request_at']).total_seconds()
+    if elapsed < config.OTP_RETRY_COOLDOWN_SECONDS:
+        remaining = int(config.OTP_RETRY_COOLDOWN_SECONDS - elapsed)
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Cooldown active. Wait {remaining}s before requesting again."
+        )
+        
 async def authenticate(api_key: str, endpoint_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Authenticate API key. If endpoint_name is provided, ensure the key belongs to that endpoint.
@@ -251,7 +371,8 @@ async def get_pricing(country_code: str, spam_status: str, endpoint_name: str) -
 
 async def reserve_account(country_code: str, spam_status: str, endpoint_name: str) -> Optional[Dict[str, Any]]:
     """Reserve an available account for a specific endpoint"""
-    async with Database.pool.acquire() as conn:
+    pool = await Database.connect()
+    async with pool.acquire() as conn:
         async with conn.transaction():
             result = await conn.fetchrow(
                 """
@@ -281,15 +402,33 @@ async def reserve_account(country_code: str, spam_status: str, endpoint_name: st
     return None
 
 async def auto_release_account(account_id: str):
-    """Auto release account if not sold within timeout"""
+    """Auto release ONLY if balance wasn't deducted (safety for stuck reservations)"""
     await asyncio.sleep(config.RESERVATION_TIMEOUT)
     
+    # Check: is there an active transaction with balance already deducted?
+    active_tx = await Database.fetchrow(
+        """
+        SELECT transaction_id FROM transactions 
+        WHERE account_id = $1 
+          AND balance_deducted = TRUE
+          AND status IN ('otp_pending', 'otp_detected')
+        LIMIT 1
+        """,
+        account_id
+    )
+    
+    if active_tx:
+        # 🛡️ Balance already deducted — DO NOT release
+        # Account will be released only when OTP detected or 24h auto-lock kicks in
+        print(f"⏸️ Skipping auto-release: account {account_id} has active paid transaction")
+        return
+    
+    # Safe to release — no money involved
     result = await Database.execute(
         """
         UPDATE accounts 
         SET status = 'available', reserved_at = NULL 
         WHERE account_id = $1 AND status = 'reserved'
-        RETURNING account_id
         """,
         account_id
     )
@@ -299,7 +438,7 @@ async def auto_release_account(account_id: str):
             """
             UPDATE transactions 
             SET status = 'expired', completed_at = CURRENT_TIMESTAMP
-            WHERE account_id = $1 AND status IN ('pending', 'otp_pending')
+            WHERE account_id = $1 AND status = 'pending' AND balance_deducted = FALSE
             """,
             account_id
         )
@@ -403,37 +542,11 @@ async def send_to_otp_server(
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            # If OTP server registration fails, release the account
-            await Database.execute(
-                "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
-                account['account_id']
+            # ⚠️ Do NOT release account here — caller handles it based on balance_deducted
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to register with OTP server: {str(e)}"
             )
-            raise HTTPException(status_code=500, detail=f"Failed to register with OTP server: {str(e)}")
-
-async def deduct_balance(user_id: str, user_type: str, endpoint_name: str, amount: float):
-    """Deduct user balance for specific endpoint"""
-    result = await Database.execute(
-        """
-        UPDATE users 
-        SET balance = balance - $3, updated_at = CURRENT_TIMESTAMP 
-        WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $4 AND balance >= $3
-        """,
-        user_id, user_type, amount, endpoint_name
-    )
-    
-    if "UPDATE 0" in result:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
-
-async def mark_account_sold(account_id: str):
-    """Mark account as sold"""
-    await Database.execute(
-        """
-        UPDATE accounts 
-        SET status = 'sold', sold_at = CURRENT_TIMESTAMP 
-        WHERE account_id = $1
-        """,
-        account_id
-    )
 
 async def create_transaction(
     user_identifier: str, 
@@ -443,15 +556,16 @@ async def create_transaction(
     purchase_code: str,
     endpoint_name: str
 ) -> Dict:
-    """Create transaction record with purchase code and endpoint"""
     transaction_id = str(uuid.uuid4())
     await Database.execute(
         """
         INSERT INTO transactions (
             transaction_id, user_id, user_type, account_id, 
-            amount, country_code, spam_status, purchase_code, otp_status, endpoint_name
+            amount, country_code, spam_status, purchase_code, 
+            otp_status, endpoint_name, status, balance_deducted,
+            last_otp_request_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'none', $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'none', $9, 'otp_pending', FALSE, NOW())
         """,
         transaction_id,
         user_identifier,
@@ -471,7 +585,7 @@ async def create_transaction(
         "purchase_code": purchase_code,
         "endpoint_name": endpoint_name
     }
-
+    
 def hide_phone(phone_number: str) -> str:
     """Hide middle digits of phone number"""
     if len(phone_number) <= 6:
@@ -495,172 +609,49 @@ async def get_daily_retry_count(user_identifier: str, user_type: str, endpoint_n
     )
     return int(result['retry_count']) if result else 0
 
-async def mark_transaction_complete(transaction_id: str, account_id: str, user_id: str, user_type: str, endpoint_name: str, amount: float):
-    """Mark transaction as complete and deduct balance - NO REFUND POLICY"""
-    async with Database.pool.acquire() as conn:
-        async with conn.transaction():
-            check = await conn.fetchrow(
-                "SELECT status FROM transactions WHERE transaction_id = $1 FOR UPDATE",
-                transaction_id
-            )
-            
-            if check['status'] == 'completed':
-                return False
-            
-            result = await conn.execute(
-                """
-                UPDATE users 
-                SET balance = balance - $3, updated_at = CURRENT_TIMESTAMP 
-                WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $4 AND balance >= $3
-                """,
-                user_id, user_type, amount, endpoint_name
-            )
-            
-            if "UPDATE 0" in result:
-                await conn.execute(
-                    "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
-                    account_id
-                )
-                await conn.execute(
-                    "UPDATE transactions SET status = 'failed', completed_at = NOW() WHERE transaction_id = $1",
-                    transaction_id
-                )
-                raise HTTPException(status_code=400, detail="Insufficient balance")
-            
-            await conn.execute(
-                """
-                UPDATE transactions 
-                SET status = 'completed', 
-                    otp_status = 'detected',
-                    completed_at = NOW() 
-                WHERE transaction_id = $1
-                """,
-                transaction_id
-            )
-            
-            await conn.execute(
-                """
-                UPDATE accounts 
-                SET status = 'sold', 
-                    sold_at = NOW(),
-                    reserved_at = NULL
-                WHERE account_id = $1
-                """,
-                account_id
-            )
-            
-            return True
-
-async def mark_transaction_expired(transaction_id: str, account_id: str):
-    """Mark transaction as expired and release account for retry"""
-    await Database.execute(
-        """
-        UPDATE transactions 
-        SET status = 'expired', 
-            otp_status = 'expired',
-            completed_at = NOW() 
-        WHERE transaction_id = $1 AND status NOT IN ('completed', 'cancelled')
-        """,
-        transaction_id
-    )
-    
-    await Database.execute(
-        """
-        UPDATE accounts 
-        SET status = 'available', 
-            reserved_at = NULL 
-        WHERE account_id = $1 AND status IN ('reserved', 'pending_takeover')
-        """,
-        account_id
-    )
-
-async def mark_account_takeover_complete(transaction_id: str, account_id: str, user_id: str, user_type: str, endpoint_name: str, amount: float):
-    """Mark account takeover as complete (unauthorized/session_expired status)"""
-    async with Database.pool.acquire() as conn:
-        async with conn.transaction():
-            check = await conn.fetchrow(
-                "SELECT status FROM transactions WHERE transaction_id = $1 FOR UPDATE",
-                transaction_id
-            )
-            
-            if check['status'] == 'completed':
-                return False
-            
-            if check['status'] in ('otp_sent', 'pending', 'otp_pending'):
-                result = await conn.execute(
-                    """
-                    UPDATE users 
-                    SET balance = balance - $3, updated_at = CURRENT_TIMESTAMP 
-                    WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $4 AND balance >= $3
-                    """,
-                    user_id, user_type, amount, endpoint_name
-                )
-                
-                if "UPDATE 0" in result:
-                    await conn.execute(
-                        "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
-                        account_id
-                    )
-                    raise HTTPException(status_code=400, detail="Insufficient balance")
-            
-            await conn.execute(
-                """
-                UPDATE transactions 
-                SET status = 'completed', 
-                    otp_status = 'unauthorized',
-                    completed_at = NOW() 
-                WHERE transaction_id = $1
-                """,
-                transaction_id
-            )
-            
-            await conn.execute(
-                """
-                UPDATE accounts 
-                SET status = 'sold', 
-                    sold_at = NOW(),
-                    reserved_at = NULL
-                WHERE account_id = $1
-                """,
-                account_id
-            )
-            
-            return True
-
 async def cleanup_expired_transactions():
-    """Background task to cleanup expired transactions"""
+    """Cleanup old transactions, but NEVER auto-expire otp_pending"""
     while True:
         try:
-            result = await Database.fetch(
+            # Only expire truly stuck 'pending' (never sent to OTP server)
+            rows = await Database.fetch(
                 """
                 SELECT t.transaction_id, t.account_id
                 FROM transactions t
-                WHERE t.status IN ('pending', 'otp_pending')
-                  AND t.created_at < CURRENT_TIMESTAMP - INTERVAL '5 minutes'
+                WHERE t.status = 'pending'
+                  AND t.created_at < CURRENT_TIMESTAMP - INTERVAL '10 minutes'
                 """
             )
             
-            for row in result:
+            for row in rows:
                 await Database.execute(
-                    "UPDATE transactions SET status = 'expired', completed_at = CURRENT_TIMESTAMP WHERE transaction_id = $1",
+                    "UPDATE transactions SET status = 'problem', lock_reason = 'stuck_pending', locked_at = NOW() WHERE transaction_id = $1",
                     row['transaction_id']
                 )
-                
                 await Database.execute(
                     "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1 AND status = 'reserved'",
                     row['account_id']
                 )
             
+            # 🔥 NEW: Auto-lock old otp_pending transactions (24h)
+            await Database.execute(
+                """
+                UPDATE transactions 
+                SET status = 'locked',
+                    locked_at = NOW(),
+                    lock_reason = 'auto_lock_after_24h'
+                WHERE status IN ('otp_pending', 'otp_detected')
+                  AND created_at < NOW() - INTERVAL '24 hours'
+                """
+            )
+            
         except Exception as e:
-            print(f"Error in cleanup task: {str(e)}")
+            print(f"Cleanup error: {e}")
         
         await asyncio.sleep(config.CLEANUP_INTERVAL)
-
 # ============ Rate Limiting ============
-rate_limit_cache = {}
 
 async def rate_limit(api_key: str):
-    """Simple rate limiting"""
     current_time = datetime.now()
     minute_key = current_time.strftime("%Y%m%d%H%M")
     
@@ -668,13 +659,14 @@ async def rate_limit(api_key: str):
         rate_limit_cache[api_key] = {}
     
     if minute_key not in rate_limit_cache[api_key]:
-        rate_limit_cache[api_key] = {minute_key: 0}
+        rate_limit_cache[api_key][minute_key] = 0   # ✅ এটা ঠিক
     
     rate_limit_cache[api_key][minute_key] += 1
     
     if rate_limit_cache[api_key][minute_key] > config.RATE_LIMIT_PER_MINUTE:
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     
+    # Purge old minutes
     if len(rate_limit_cache[api_key]) > 10:
         sorted_keys = sorted(rate_limit_cache[api_key].keys())
         for old_key in sorted_keys[:-5]:
@@ -744,10 +736,17 @@ async def purchase_initiate(
     request: PurchaseInitiateRequest,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """Initiate purchase flow (endpoint-aware)"""
+    """
+    🔥 NEW FLOW:
+    1. Check balance
+    2. Check stock  
+    3. DEDUCT BALANCE IMMEDIATELY
+    4. Reserve account
+    5. Send to OTP server
+    6. NO REFUND, NO CANCEL
+    """
     await rate_limit(api_key)
     
-    # Authenticate with endpoint
     user_data = await authenticate(api_key, request.endpoint_name)
     
     if user_data['is_admin']:
@@ -755,27 +754,39 @@ async def purchase_initiate(
     
     endpoint_name = user_data['endpoint_name']
     
-    daily_retries = await get_daily_retry_count(request.user_identifier, request.user_type, endpoint_name)
+    # 1. Daily retry limit
+    daily_retries = await get_daily_retry_count(
+        request.user_identifier, request.user_type, endpoint_name
+    )
     if daily_retries >= config.MAX_DAILY_RETRIES:
         raise HTTPException(
             status_code=429, 
-            detail=f"Daily retry limit reached ({config.MAX_DAILY_RETRIES}). Please try again tomorrow."
+            detail=f"Daily retry limit reached. Contact {config.ADMIN_CONTACT}"
         )
     
-    balance = await get_user_balance(request.user_identifier, request.user_type, endpoint_name)
+    # 2. Check balance (first check)
+    balance = await get_user_balance(
+        request.user_identifier, request.user_type, endpoint_name
+    )
     pricing = await get_pricing(request.country_code, request.spam_status, endpoint_name)
     
     if balance < pricing['price']:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Insufficient balance. Required: {pricing['price']}, Available: {balance}"
+        )
     
-    account = await reserve_account(request.country_code, request.spam_status, endpoint_name)
-    
+    # 3. Check stock availability
+    account = await reserve_account(
+        request.country_code, request.spam_status, endpoint_name
+    )
     if not account:
         raise HTTPException(status_code=404, detail="Stock not found for requested criteria")
     
+    transaction = None
     try:
+        # 4. Create transaction record FIRST
         purchase_code = uuid.uuid4().hex[:10].upper()
-        
         transaction = await create_transaction(
             request.user_identifier,
             request.user_type,
@@ -785,16 +796,31 @@ async def purchase_initiate(
             endpoint_name
         )
         
-        otp_server = await get_available_otp_server()
+        # 🔥 5. DEDUCT BALANCE IMMEDIATELY (atomic)
+        await deduct_balance_immediately(
+            transaction['transaction_id'],
+            request.user_identifier,
+            request.user_type,
+            endpoint_name,
+            pricing['price']
+        )
         
+        # 6. Send to OTP server
+        otp_server = await get_available_otp_server()
         await send_to_otp_server(
-            otp_server, 
-            account, 
+            otp_server,
+            account,
             transaction['transaction_id'],
             purchase_code,
             user_data['config'],
             user_identifier=request.user_identifier,
             user_type=request.user_type
+        )
+        
+        # Update last OTP request time
+        await Database.execute(
+            "UPDATE transactions SET last_otp_request_at = NOW() WHERE transaction_id = $1",
+            transaction['transaction_id']
         )
         
         return {
@@ -812,27 +838,110 @@ async def purchase_initiate(
             "price": pricing['price'],
             "two_fa_password": account.get('two_fa_password'),
             "otp_timeout": config.OTP_TIMEOUT,
-            "reservation_timeout": config.RESERVATION_TIMEOUT,
             "endpoint_channel_username": user_data['config'].get('channel_username'),
-            "daily_retries_remaining": config.MAX_DAILY_RETRIES - daily_retries
+            "daily_retries_remaining": config.MAX_DAILY_RETRIES - daily_retries,
+            "balance_deducted": True,
+            "no_refund": True,
+            "admin_contact": config.ADMIN_CONTACT,
+            "note": "Balance has been deducted. No cancellation or refund available."
         }
+        
+    except HTTPException as e:
+        # Re-check if balance was already deducted
+        balance_was_deducted = False
+        if transaction:
+            tx_check = await Database.fetchrow(
+                "SELECT balance_deducted FROM transactions WHERE transaction_id = $1",
+                transaction['transaction_id']
+            )
+            balance_was_deducted = tx_check and tx_check['balance_deducted']
+    
+        if account:
+            # Only release account if balance NOT deducted
+            if not balance_was_deducted:
+                await Database.execute(
+                    "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
+                    account['account_id']
+                )
+            # else: keep reserved, admin will handle
+    
+        if transaction:
+            if balance_was_deducted:
+                # ⚠️ Balance already gone — mark problem for admin
+                await Database.execute(
+                    """
+                    UPDATE transactions 
+                    SET status = 'problem',
+                        lock_reason = $2,
+                        locked_at = NOW()
+                    WHERE transaction_id = $1
+                    """,
+                    transaction['transaction_id'],
+                    f"OTP server error after deduction: {e.detail}"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"⚠️ Server error after balance deduction. "
+                        f"Contact admin {config.ADMIN_CONTACT} immediately. "
+                        f"Transaction ID: {transaction['transaction_id']}"
+                    )
+                )
+            else:
+                await Database.execute(
+                    "UPDATE transactions SET status = 'failed', lock_reason = 'initiate_error' WHERE transaction_id = $1",
+                    transaction['transaction_id']
+                )
+        raise
+        
     except Exception as e:
-        await Database.execute(
-            "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
-            account['account_id']
+        # Re-check balance deduction
+        balance_was_deducted = False
+        if transaction:
+            tx_check = await Database.fetchrow(
+                "SELECT balance_deducted FROM transactions WHERE transaction_id = $1",
+                transaction['transaction_id']
+            )
+            balance_was_deducted = tx_check and tx_check['balance_deducted']
+    
+        if account and not balance_was_deducted:
+            await Database.execute(
+                "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
+                account['account_id']
+            )
+    
+        if transaction:
+            await Database.execute(
+                """
+                UPDATE transactions 
+                SET status = 'problem', 
+                    lock_reason = $2,
+                    locked_at = NOW()
+                WHERE transaction_id = $1
+                """,
+                transaction['transaction_id'],
+                f"Initiate error: {str(e)}"
+            )
+    
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"⚠️ Server error. Contact admin {config.ADMIN_CONTACT} with "
+                f"transaction ID: {transaction['transaction_id'] if transaction else 'N/A'}"
+            )
         )
-        await Database.execute(
-            "UPDATE transactions SET status = 'failed' WHERE transaction_id = $1",
-            transaction['transaction_id']
-        )
-        raise e
 
 @app.post("/api/purchase/request-otp")
 async def request_otp_again(
     request: RetryOTPRequest,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """Request OTP again (endpoint-aware)"""
+    """
+    🔥 NEW FLOW:
+    - OTP detected-এর আগে: normal retry (cooldown সহ)
+    - OTP detected-এর পরে: STRICT retry (2-3 বার max, 30s cooldown)
+    - Unauthorized হলেই বন্ধ
+    """
     await rate_limit(api_key)
     
     tx = await Database.fetchrow(
@@ -847,25 +956,56 @@ async def request_otp_again(
     if not tx:
         raise HTTPException(status_code=404, detail="Transaction not found")
     
-    # Determine endpoint from transaction
     endpoint_name = tx['endpoint_name']
-    
-    # Authenticate with endpoint
     user_data = await authenticate(api_key, endpoint_name)
     
-    daily_retries = await get_daily_retry_count(tx['user_id'], tx['user_type'], endpoint_name)
-    if daily_retries >= config.MAX_DAILY_RETRIES:
+    # 🔴 Blocked statuses
+    if tx['status'] in ('unauthorized', 'cancelled', 'failed', 'problem'):
         raise HTTPException(
-            status_code=429, 
-            detail=f"Daily retry limit reached ({config.MAX_DAILY_RETRIES}). Please try again tomorrow."
+            status_code=400, 
+            detail=f"Cannot retry. Transaction is {tx['status']}. Contact {config.ADMIN_CONTACT}"
         )
     
-    if tx['status'] not in ('expired', 'otp_pending'):
-        raise HTTPException(status_code=400, detail="Cannot request OTP at this stage")
+    # 🔴 Cooldown check
+    await check_otp_cooldown(request.transaction_id)
     
-    if tx['otp_attempts'] >= config.MAX_OTP_ATTEMPTS:
-        raise HTTPException(status_code=429, detail="Max OTP attempts reached for this transaction")
+    # 🟡 STRICT MODE: OTP already detected once?
+    otp_detected_before = tx['otp_detected_count'] > 0
     
+    if otp_detected_before:
+        # 🚨 STRICT PATH — scam prevention
+        await strict_rate_limit(tx['user_id'], endpoint_name)
+        
+        # Strict retry limit
+        if tx['otp_retry_count'] >= config.MAX_OTP_RETRIES_AFTER_DETECTION:
+            # LOCK the transaction permanently
+            await Database.execute(
+                """
+                UPDATE transactions 
+                SET status = 'locked',
+                    locked_at = NOW(),
+                    lock_reason = 'max_retries_after_detection_exceeded'
+                WHERE transaction_id = $1
+                """,
+                request.transaction_id
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"🚫 LOCKED: Maximum retries after OTP detection exceeded "
+                    f"({config.MAX_OTP_RETRIES_AFTER_DETECTION}). "
+                    f"Contact admin {config.ADMIN_CONTACT} if this was a mistake."
+                )
+            )
+    
+    # Normal retry limit (before detection)
+    if not otp_detected_before and tx['otp_attempts'] >= config.MAX_OTP_ATTEMPTS:
+        raise HTTPException(
+            status_code=429, 
+            detail=f"Max OTP attempts reached. Contact {config.ADMIN_CONTACT}"
+        )
+    
+    # Get or reserve account
     account = await Database.fetchrow(
         "SELECT * FROM accounts WHERE account_id = $1 AND status IN ('available', 'reserved')",
         tx['account_id']
@@ -882,68 +1022,126 @@ async def request_otp_again(
             request.transaction_id
         )
     
+    # Update counters
     await Database.execute(
         """
         UPDATE transactions 
-        SET otp_attempts = otp_attempts + 1, 
-            status = 'otp_pending', 
+        SET otp_attempts = otp_attempts + 1,
+            otp_retry_count = otp_retry_count + 1,
+            last_otp_request_at = NOW(),
             otp_status = 'none'
         WHERE transaction_id = $1
         """,
         request.transaction_id
     )
     
+    # Send to OTP server
     otp_server = await get_available_otp_server()
-    await send_to_otp_server(
-        otp_server,
-        account,
-        request.transaction_id,
-        tx['purchase_code'],
-        user_data['config'],
-        user_identifier=tx['user_id'],
-        user_type=tx['user_type']
-    )
+    try:
+        await send_to_otp_server(
+            otp_server,
+            account,
+            request.transaction_id,
+            tx['purchase_code'],
+            user_data['config'],
+            user_identifier=tx['user_id'],
+            user_type=tx['user_type']
+        )
+    except HTTPException as e:
+        # Balance already deducted — mark problem
+        await Database.execute(
+            """
+            UPDATE transactions 
+            SET status = 'problem',
+                lock_reason = $2,
+                locked_at = NOW()
+            WHERE transaction_id = $1
+            """,
+            request.transaction_id,
+            f"OTP retry failed: {e.detail}"
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"⚠️ OTP retry failed. Balance already deducted. "
+                f"Contact admin {config.ADMIN_CONTACT}. Transaction: {request.transaction_id}"
+            )
+        )
     
-    return {
-        "success": True,
-        "message": "OTP request sent successfully",
-        "attempts_remaining": config.MAX_OTP_ATTEMPTS - (tx['otp_attempts'] + 1),
-        "daily_retries_remaining": config.MAX_DAILY_RETRIES - daily_retries
-    }
+    # Response
+    if otp_detected_before:
+        remaining = config.MAX_OTP_RETRIES_AFTER_DETECTION - (tx['otp_retry_count'] + 1)
+        return {
+            "success": True,
+            "message": "⚠️ STRICT MODE: OTP request sent (account already accessed before)",
+            "strict_mode": True,
+            "strict_retries_remaining": max(0, remaining),
+            "cooldown_seconds": config.OTP_RETRY_COOLDOWN_SECONDS,
+            "warning": "Repeated requests after OTP detection may result in account lock."
+        }
+    else:
+        return {
+            "success": True,
+            "message": "OTP request sent",
+            "strict_mode": False,
+            "attempts_remaining": config.MAX_OTP_ATTEMPTS - (tx['otp_attempts'] + 1),
+            "cooldown_seconds": config.OTP_RETRY_COOLDOWN_SECONDS,
+            "daily_retries_remaining": config.MAX_DAILY_RETRIES - await get_daily_retry_count(
+                tx['user_id'], tx['user_type'], endpoint_name
+            )
+        }
 
 @app.post("/api/purchase/cancel")
 async def cancel_reservation(
     request: CancelReservationRequest,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """Cancel reservation (endpoint-aware)"""
+    """
+    🔒 ADMIN-ONLY cancellation. 
+    Users CANNOT cancel — no refund policy.
+    """
     await rate_limit(api_key)
     
     transaction = await Database.fetchrow(
-        "SELECT * FROM transactions WHERE transaction_id = $1 AND status IN ('pending', 'otp_pending')",
+        "SELECT * FROM transactions WHERE transaction_id = $1",
         request.transaction_id
     )
     
     if not transaction:
-        raise HTTPException(status_code=404, detail="Transaction not found or not pending")
+        raise HTTPException(status_code=404, detail="Transaction not found")
     
     user_data = await authenticate(api_key, transaction['endpoint_name'])
     
-    if request.user_identifier and not user_data['is_admin']:
-        if transaction['user_id'] != request.user_identifier:
-            raise HTTPException(status_code=403, detail="Not authorized to cancel this transaction")
+    if not user_data['is_admin']:
+        raise HTTPException(
+            status_code=403, 
+            detail=(
+                f"❌ Users cannot cancel. Balance already deducted (no refund). "
+                f"Contact admin {config.ADMIN_CONTACT} for issues."
+            )
+        )
     
+    # Admin override — can cancel + optionally refund
     await Database.execute(
-        "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
+        "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1 AND status = 'reserved'",
         transaction['account_id']
     )
     
     await Database.execute(
-        "UPDATE transactions SET status = 'cancelled' WHERE transaction_id = $1",
+        """
+        UPDATE transactions 
+        SET status = 'cancelled_by_admin',
+            locked_at = NOW(),
+            lock_reason = 'admin_cancelled'
+        WHERE transaction_id = $1
+        """,
         request.transaction_id
     )
     
-    return {"success": True, "message": "Reservation cancelled successfully"}
+    return {
+        "success": True,
+        "message": "Transaction cancelled by admin. (Balance refund is manual.)"
+    }
 
 # ============ Internal Endpoints ============
 @app.post("/api/otp/callback")
@@ -951,7 +1149,12 @@ async def otp_callback(
     callback: OTPServerCallback,
     internal_api_key: str = Header(..., alias="X-Internal-Key")
 ):
-    """OTP server callback endpoint (endpoint-aware)"""
+    """
+    🔥 NEW LOGIC:
+    - detected → otp_detected (increment count, mark account sold)
+    - timeout → otp_pending (KEEP trying)
+    - unauthorized → unauthorized (FINAL, no refund)
+    """
     if internal_api_key != config.INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Invalid internal API key")
     
@@ -973,76 +1176,108 @@ async def otp_callback(
     
     endpoint_name = tx['endpoint_name']
     
+    # ============ OTP DETECTED ============
     if callback.status == "detected":
-        try:
-            completed = await mark_transaction_complete(
-                callback.transaction_id,
-                tx['account_id'],
-                tx['user_id'],
-                tx['user_type'],
-                endpoint_name,
-                float(tx['amount'])
-            )
-            
-            if not completed:
-                return {"success": False, "message": "Transaction already completed"}
-            
-            if callback.otp_code:
-                await Database.execute(
+        async with Database.pool.acquire() as conn:
+            async with conn.transaction():
+                # Increment detection counter
+                await conn.execute(
                     """
-                    INSERT INTO otp_requests (transaction_id, otp_code, status, expires_at)
-                    VALUES ($1, $2, 'sent', NOW() + INTERVAL '10 minutes')
-                    ON CONFLICT (transaction_id) 
-                    DO UPDATE SET otp_code = $2, status = 'sent', expires_at = NOW() + INTERVAL '10 minutes'
+                    UPDATE transactions 
+                    SET otp_detected_count = otp_detected_count + 1,
+                        first_otp_detected_at = COALESCE(first_otp_detected_at, NOW()),
+                        status = 'otp_detected',
+                        otp_status = 'detected'
+                    WHERE transaction_id = $1
                     """,
-                    callback.transaction_id,
-                    callback.otp_code
+                    callback.transaction_id
                 )
-            
-            return {
-                "success": True, 
-                "message": "OTP detected - transaction completed and balance deducted",
-                "completed": True,
-                "no_refund": True
-            }
-        except HTTPException as e:
-            return {"success": False, "message": str(e.detail)}
-        except Exception as e:
-            return {"success": False, "message": f"Error completing transaction: {str(e)}"}
-    
-    elif callback.status == "timeout":
-        await mark_transaction_expired(callback.transaction_id, tx['account_id'])
+                
+                # Mark account sold (permanent)
+                await conn.execute(
+                    """
+                    UPDATE accounts 
+                    SET status = 'sold', sold_at = NOW(), reserved_at = NULL
+                    WHERE account_id = $1
+                    """,
+                    tx['account_id']
+                )
+        
+        # Store OTP code
+        if callback.otp_code:
+            await Database.execute(
+                """
+                INSERT INTO otp_requests (transaction_id, otp_code, status, expires_at)
+                VALUES ($1, $2, 'sent', NOW() + INTERVAL '10 minutes')
+                ON CONFLICT (transaction_id) 
+                DO UPDATE SET otp_code = $2, status = 'sent', expires_at = NOW() + INTERVAL '10 minutes'
+                """,
+                callback.transaction_id,
+                callback.otp_code
+            )
+        
         return {
-            "success": True, 
-            "message": "OTP timeout - transaction expired",
-            "can_retry": True,
-            "retry_limit": config.MAX_DAILY_RETRIES
+            "success": True,
+            "message": "✅ OTP detected — transaction marked. Account is now sold.",
+            "otp_detected_count": tx['otp_detected_count'] + 1,
+            "no_refund": True
         }
     
+    # ============ OTP TIMEOUT (keep pending!) ============
+    elif callback.status == "timeout":
+        # 🔥 DO NOT EXPIRE — keep as otp_pending for retry
+        await Database.execute(
+            """
+            UPDATE transactions 
+            SET otp_status = 'timeout'
+            WHERE transaction_id = $1 AND status NOT IN ('unauthorized', 'locked', 'cancelled')
+            """,
+            callback.transaction_id
+        )
+        
+        # Account remains reserved — user can retry
+        return {
+            "success": True,
+            "message": "⏳ OTP timeout — transaction still pending. You can retry.",
+            "can_retry": True,
+            "cooldown_seconds": config.OTP_RETRY_COOLDOWN_SECONDS
+        }
+    
+    # ============ UNAUTHORIZED (final) ============
     elif callback.status in ("unauthorized", "session_expired"):
-        try:
-            completed = await mark_account_takeover_complete(
-                callback.transaction_id,
-                tx['account_id'],
-                tx['user_id'],
-                tx['user_type'],
-                endpoint_name,
-                float(tx['amount'])
-            )
-            
-            if not completed:
-                return {"success": False, "message": "Transaction already completed"}
-            
-            return {
-                "success": True, 
-                "message": f"{callback.status.replace('_', ' ').title()} - takeover confirmed and balance deducted",
-                "completed": True,
-                "no_refund": True
-            }
-        except HTTPException as e:
-            return {"success": False, "message": str(e.detail)}
-        except Exception as e:
-            return {"success": False, "message": f"Error completing takeover: {str(e)}"}
+        await Database.execute(
+            """
+            UPDATE transactions 
+            SET status = 'unauthorized',
+                otp_status = $2,
+                locked_at = NOW(),
+                lock_reason = $2
+            WHERE transaction_id = $1
+            """,
+            callback.transaction_id,
+            callback.status
+        )
+        
+        # Account marked sold (no reuse)
+        await Database.execute(
+            """
+            UPDATE accounts 
+            SET status = 'sold', sold_at = NOW(), reserved_at = NULL
+            WHERE account_id = $1
+            """,
+            tx['account_id']
+        )
+        
+        return {
+            "success": True,
+            "message": (
+                f"❌ {callback.status} — transaction closed. "
+                f"NO REFUND. Contact admin {config.ADMIN_CONTACT} if problem."
+            ),
+            "final_status": "unauthorized",
+            "no_refund": True,
+            "admin_contact": config.ADMIN_CONTACT
+        }
     
     else:
         return {"success": False, "message": f"Unknown status: {callback.status}"}
@@ -1374,13 +1609,18 @@ async def list_accounts(
     
     total = await Database.fetchval(count_query, *count_params)
     rows = await Database.fetch(query, *params)
-    
+    accounts = []
+    for row in rows:
+        account = dict(row)
+        if not user_data['is_admin']:
+            account['phone_number'] = hide_phone(account['phone_number'])
+        accounts.append(account)
     return {
         "success": True,
         "total": total,
         "limit": limit,
         "offset": offset,
-        "accounts": [dict(row) for row in rows]  # phone_number হাইড করে দিতে পারেন অথবা রাখতে পারেন (অ্যাডমিন তাই রাখা ভালো)
+        "accounts": accounts
     }
 @app.get("/api/admin/stock")
 async def view_stock(
@@ -1723,6 +1963,32 @@ async def init_database():
         )
     """)
     
+    # 🆕 Migration: Add new columns if they don't exist
+    await Database.execute("""
+        ALTER TABLE accounts 
+        ADD COLUMN IF NOT EXISTS first_name VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS last_name VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS username VARCHAR(100),
+        ADD COLUMN IF NOT EXISTS account_age_days INTEGER,
+        ADD COLUMN IF NOT EXISTS profile_pic_url TEXT,
+        ADD COLUMN IF NOT EXISTS bio TEXT,
+        ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS is_business BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS last_active TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS quality_score INTEGER
+    """)
+    
+    # 🆕 Migration: transactions-এ নতুন column
+    await Database.execute("""
+        ALTER TABLE transactions 
+        ADD COLUMN IF NOT EXISTS balance_deducted BOOLEAN DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS otp_detected_count INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS otp_retry_count INTEGER DEFAULT 0,
+        ADD COLUMN IF NOT EXISTS first_otp_detected_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS last_otp_request_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP,
+        ADD COLUMN IF NOT EXISTS lock_reason TEXT
+    """)
     # Indexes for performance
     await Database.execute("CREATE INDEX IF NOT EXISTS idx_accounts_endpoint_status ON accounts(endpoint_name, status)")
     await Database.execute("CREATE INDEX IF NOT EXISTS idx_accounts_endpoint_country_status ON accounts(endpoint_name, country_code, spam_status, status)")
@@ -1757,7 +2023,9 @@ async def startup_event():
     print(f"🔑 OTP Servers: {len(config.OTP_SERVERS)} configured")
     print(f"⏰ Auto-cleanup: Every {config.CLEANUP_INTERVAL} seconds")
     print(f"🎯 Role: Orchestration + Database + Callbacks")
-    print(f"💳 Payment Policy: NO REFUND - Balance deducted on OTP detection")
+    print(f"💳 Payment Policy: NO REFUND - Balance deducted on purchase request")
+    print(f"🔒 Strict retry: {config.MAX_OTP_RETRIES_AFTER_DETECTION} after OTP detection")
+    print(f"📞 Admin contact: {config.ADMIN_CONTACT}")
     print(f"🔄 Daily Retry Limit: {config.MAX_DAILY_RETRIES} per user per endpoint")
     print(f"🏢 Endpoint System: Enabled (each endpoint isolated)")
 
