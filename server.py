@@ -4,10 +4,10 @@ import uuid
 import secrets
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from decimal import Decimal
-import random
+import logging 
+import hmac
+import hashlib
 import json
-
 import asyncpg
 import httpx
 from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
@@ -17,6 +17,12 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("main-server")
 
 # ============ Configuration ============
 class Config:
@@ -38,6 +44,9 @@ class Config:
     STRICT_RATE_LIMIT_PER_MINUTE = int(os.getenv("STRICT_RATE_LIMIT_PER_MINUTE", "2"))
     ADMIN_CONTACT = os.getenv("ADMIN_CONTACT", "@your_admin_username")
     PROBLEM_AUTO_EXPIRE_HOURS = int(os.getenv("PROBLEM_AUTO_EXPIRE_HOURS", "24"))
+    WEBHOOK_TIMEOUT = int(os.getenv("WEBHOOK_TIMEOUT", "10"))
+    WEBHOOK_MAX_ATTEMPTS = int(os.getenv("WEBHOOK_MAX_ATTEMPTS", "4"))
+    WEBHOOK_RETRY_BACKOFF = [5, 30, 120, 600]   # seconds, len must be >= MAX-1
 
 config = Config()
 
@@ -91,7 +100,17 @@ class EndpointRegistrationRequest(BaseModel):
     admin_telegram_id: int
     bot_token: str
     channel_username: str
+    webhook_url: Optional[str] = Field(
+        None, description="Per-endpoint webhook URL (https://...)"
+    )
+    webhook_enabled: Optional[bool] = False
 
+
+class WebhookConfigUpdateRequest(BaseModel):
+    webhook_url: Optional[str] = None       # None দিলে ক্লিয়ার হবে না
+    webhook_enabled: Optional[bool] = None
+    rotate_secret: Optional[bool] = False   # True দিলে নতুন secret generate হবে
+    
 class EndpointConfigCreateRequest(BaseModel):
     endpoint_name: str
     admin_api_key: str
@@ -100,10 +119,15 @@ class EndpointConfigCreateRequest(BaseModel):
     admin_telegram_id: Optional[int] = None
     channel_username: Optional[str] = None
 
+class UserRegistrationRequest(BaseModel):
+    user_identifier: str = Field(..., min_length=1, max_length=255,
+                                 description="User ID / Username / Email / etc.")
+    user_type: str = Field(..., pattern="^(Id|Username|Email|Telegram|WhatsApp|Phone|Other)$",
+                           description="Id, Username, Email, Telegram, etc.")
+    initial_balance: Optional[float] = Field(0.0, ge=0,
+                                             description="Optional starting balance")
+                                             
 class PurchaseInitiateRequest(BaseModel):
-    endpoint_name: str  # Endpoint name required for purchase
-    user_identifier: str = Field(..., description="User ID or identifier")
-    user_type: str = Field(..., pattern="^(telegram|bot|api)$")
     country_code: str = Field(..., min_length=2, max_length=2)
     spam_status: str = Field(..., pattern="^(good|limited|bad)$")
 
@@ -147,7 +171,7 @@ class PricingRequest(BaseModel):
 
 class BalanceRequest(BaseModel):
     user_id: str
-    user_type: str = Field(..., pattern="^(telegram|bot|api)$")
+    user_type: str = Field(..., min_length=1, max_length=50)   # flexible
     amount: float
 
 class UserBalanceRequest(BaseModel):
@@ -186,6 +210,185 @@ app.add_middleware(
 )
 
 # ============ Helper Functions ============
+def _compute_webhook_signature(secret: str, body: bytes) -> str:
+    """Returns 'sha256=<hex>'."""
+    mac = hmac.new(secret.encode("utf-8"), body, hashlib.sha256)
+    return f"sha256={mac.hexdigest()}"
+
+
+async def fire_webhook(
+    endpoint_name: str,
+    event_type: str,
+    payload: Dict[str, Any],
+    transaction_id: Optional[str] = None,
+) -> None:
+    """
+    Queue + fire webhook to the endpoint's configured URL.
+    Non-blocking — delivery happens in a background task with retries.
+    """
+    cfg = await Database.fetchrow(
+        """
+        SELECT webhook_url, webhook_secret, webhook_enabled
+        FROM endpoint_configs WHERE endpoint_name = $1
+        """,
+        endpoint_name,
+    )
+    if not cfg or not cfg['webhook_enabled'] or not cfg['webhook_url']:
+        return  # endpoint has no webhook — silently skip
+
+    # Ensure timestamp present
+    payload = {**payload, 
+               "timestamp": payload.get("timestamp") or datetime.now().isoformat(),
+               "endpoint_name": payload.get("endpoint_name") or endpoint_name,
+               "event": payload.get("event") or event_type}
+    payload.setdefault("endpoint_name", endpoint_name)
+    payload.setdefault("event", event_type)
+
+    delivery_id = await Database.fetchval(
+        """
+        INSERT INTO webhook_deliveries
+            (endpoint_name, event_type, transaction_id,
+             webhook_url, payload, status)
+        VALUES ($1, $2, $3, $4, $5::jsonb, 'pending')
+        RETURNING delivery_id
+        """,
+        endpoint_name, event_type,
+        transaction_id, cfg['webhook_url'],
+        json.dumps(payload, separators=(',', ':'), default=str),
+    )
+    logger.info(
+        "Webhook queued | delivery=%s endpoint=%s event=%s",
+        delivery_id, endpoint_name, event_type,
+    )
+    asyncio.create_task(_deliver_webhook(str(delivery_id)))
+
+
+async def _deliver_webhook(delivery_id: str) -> None:
+    """Deliver a queued webhook with exponential backoff. Idempotent."""
+    delivery = await Database.fetchrow(
+        "SELECT * FROM webhook_deliveries WHERE delivery_id = $1",
+        delivery_id,
+    )
+    if not delivery or delivery['status'] == 'delivered':
+        return
+
+    # recently attempted — skip (protect against duplicate spawn)
+    if delivery['last_attempt_at'] and \
+       (datetime.now() - delivery['last_attempt_at']).total_seconds() < 30:
+        return
+
+    cfg = await Database.fetchrow(
+        "SELECT webhook_secret FROM endpoint_configs WHERE endpoint_name = $1",
+        delivery['endpoint_name'],
+    )
+    secret = (cfg['webhook_secret'] if cfg else None) or ""
+    if not secret:
+        logger.error(
+            "Webhook secret missing for endpoint=%s — refusing unsigned delivery | delivery=%s",
+            delivery['endpoint_name'], delivery_id,
+        )
+        await Database.execute(
+            """
+            UPDATE webhook_deliveries
+            SET status='failed', last_error='webhook_secret not configured'
+            WHERE delivery_id = $1
+            """,
+            delivery_id,
+        )
+        return
+
+    # asyncpg returns JSONB as str — use raw bytes so HMAC matches wire bytes
+    raw = delivery['payload']
+    if not isinstance(raw, str):
+        raw = json.dumps(raw, separators=(',', ':'), default=str)
+    body = raw.encode("utf-8")
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Webhook-Event": delivery['event_type'],
+        "X-Webhook-Delivery": str(delivery['delivery_id']),
+        "User-Agent": "Marketplace-Webhook/1.0",
+    }
+    if secret:
+        headers["X-Webhook-Signature"] = _compute_webhook_signature(secret, body)
+
+    max_attempts = config.WEBHOOK_MAX_ATTEMPTS
+    backoffs = config.WEBHOOK_RETRY_BACKOFF
+    last_error = "unknown"
+
+    for attempt in range(max_attempts):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    delivery['webhook_url'],
+                    content=body,
+                    headers=headers,
+                    timeout=config.WEBHOOK_TIMEOUT,
+                )
+
+            code = resp.status_code
+            await Database.execute(
+                """
+                UPDATE webhook_deliveries
+                SET attempts = attempts + 1,
+                    last_attempt_at = NOW(),
+                    response_code = $2
+                WHERE delivery_id = $1
+                """,
+                delivery_id, code,
+            )
+
+            if 200 <= code < 300:
+                await Database.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status = 'delivered', delivered_at = NOW(),
+                        last_error = NULL
+                    WHERE delivery_id = $1
+                    """,
+                    delivery_id,
+                )
+                logger.info(
+                    "Webhook delivered | delivery=%s endpoint=%s event=%s code=%s",
+                    delivery_id, delivery['endpoint_name'],
+                    delivery['event_type'], code,
+                )
+                return
+
+            last_error = f"HTTP {code}: {resp.text[:200]}"
+
+        except Exception as e:
+            last_error = str(e)[:500]
+            await Database.execute(
+                """
+                UPDATE webhook_deliveries
+                SET attempts = attempts + 1,
+                    last_attempt_at = NOW(),
+                    last_error = $2
+                WHERE delivery_id = $1
+                """,
+                delivery_id, last_error,
+            )
+
+        # Not the last attempt — back off
+        if attempt < max_attempts - 1:
+            delay = backoffs[min(attempt, len(backoffs) - 1)]
+            await asyncio.sleep(delay)
+
+    # All attempts failed
+    await Database.execute(
+        """
+        UPDATE webhook_deliveries
+        SET status = 'failed', last_error = $2
+        WHERE delivery_id = $1
+        """,
+        delivery_id, last_error,
+    )
+    logger.error(
+        "Webhook FAILED after %d attempts | delivery=%s endpoint=%s err=%s",
+        max_attempts, delivery_id, delivery['endpoint_name'], last_error,
+    )
+    
 # ============ NEW: Immediate Balance Deduction ============
 async def deduct_balance_immediately(
     transaction_id: str, 
@@ -338,6 +541,45 @@ async def authenticate(api_key: str, endpoint_name: Optional[str] = None) -> Dic
         "user_type": "admin" if is_admin else "user"
     }
 
+async def authenticate_user(user_api_key: str) -> Dict[str, Any]:
+    """
+    প্রতি-ইউজার API key verify করে।
+    সফল হলে user_id / user_type / endpoint_name / balance সহ dict রিটার্ন করে।
+    """
+    if not user_api_key or not user_api_key.startswith("usr_"):
+        raise HTTPException(status_code=401, detail="Invalid user API key format")
+
+    result = await Database.fetchrow(
+        """
+        SELECT 
+            u.user_id, u.user_type, u.endpoint_name, u.balance,
+            ec.bot_token, ec.admin_telegram_id, ec.channel_username,
+            ec.endpoint_name AS ec_endpoint, ec.is_active
+        FROM users u
+        JOIN endpoint_configs ec ON u.endpoint_name = ec.endpoint_name
+        WHERE u.user_api_key = $1
+          AND ec.is_active = TRUE
+        """,
+        user_api_key
+    )
+
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid or inactive user API key")
+
+    return {
+        "is_admin": False,
+        "user_id": result['user_id'],
+        "user_type": result['user_type'],
+        "endpoint_name": result['endpoint_name'],
+        "balance": float(result['balance']),
+        "config": {
+            "endpoint_name": result['endpoint_name'],
+            "bot_token": result['bot_token'],
+            "admin_telegram_id": result['admin_telegram_id'],
+            "channel_username": result['channel_username'],
+        },
+    }
+    
 async def get_user_balance(user_id: str, user_type: str, endpoint_name: str) -> float:
     """Get user balance for a specific endpoint"""
     result = await Database.fetchrow(
@@ -609,6 +851,36 @@ async def get_daily_retry_count(user_identifier: str, user_type: str, endpoint_n
     )
     return int(result['retry_count']) if result else 0
 
+async def retry_stuck_webhooks():
+    """Retry webhook deliveries stuck in 'pending' (e.g. after restart)."""
+    while True:
+        try:
+            rows = await Database.fetch(
+                """
+                SELECT delivery_id FROM webhook_deliveries
+                WHERE status = 'pending'
+                  AND attempts < $1
+                  AND (last_attempt_at IS NULL OR last_attempt_at < NOW() - INTERVAL '15 minutes')
+                  AND created_at < NOW() - INTERVAL '1 minute'
+                LIMIT 20
+                """,
+                config.WEBHOOK_MAX_ATTEMPTS,
+            )
+            await Database.execute(
+                """
+                UPDATE webhook_deliveries
+                SET status = 'failed', last_error = 'max_attempts_exhausted'
+                WHERE status = 'pending' AND attempts >= $1
+                  AND created_at < NOW() - INTERVAL '10 minutes'
+                """,
+                config.WEBHOOK_MAX_ATTEMPTS,
+            )
+            for r in rows:
+                asyncio.create_task(_deliver_webhook(str(r['delivery_id'])))
+        except Exception as e:
+            logger.warning("Webhook retry loop error: %s", e)
+        await asyncio.sleep(60)
+        
 async def cleanup_expired_transactions():
     """Cleanup old transactions, but NEVER auto-expire otp_pending"""
     while True:
@@ -644,7 +916,13 @@ async def cleanup_expired_transactions():
                   AND created_at < NOW() - INTERVAL '24 hours'
                 """
             )
-            
+            await Database.execute(
+                """
+                DELETE FROM webhook_deliveries
+                WHERE status = 'delivered' 
+                  AND delivered_at < NOW() - INTERVAL '7 days'
+                """
+            )
         except Exception as e:
             print(f"Cleanup error: {e}")
         
@@ -688,19 +966,20 @@ async def register_endpoint(
     request: EndpointRegistrationRequest,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """Register new endpoint with auto-generated API keys"""
     if api_key != config.SUPER_ADMIN_KEY:
         raise HTTPException(status_code=403, detail="Super admin access required")
-    
-    # Generate random API keys
+
     admin_api_key = secrets.token_urlsafe(32)
     user_api_key = secrets.token_urlsafe(32)
-    
+    webhook_secret = secrets.token_urlsafe(32) if request.webhook_url else None
+
     await Database.execute(
         """
         INSERT INTO endpoint_configs 
-        (endpoint_name, admin_api_key, user_api_key, bot_token, admin_telegram_id, channel_username)
-        VALUES ($1, $2, $3, $4, $5, $6)
+        (endpoint_name, admin_api_key, user_api_key, bot_token,
+         admin_telegram_id, channel_username,
+         webhook_url, webhook_secret, webhook_enabled)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         ON CONFLICT (endpoint_name) 
         DO UPDATE SET 
             admin_api_key = $2,
@@ -708,6 +987,9 @@ async def register_endpoint(
             bot_token = $4,
             admin_telegram_id = $5,
             channel_username = $6,
+            webhook_url = COALESCE($7, endpoint_configs.webhook_url),
+            webhook_enabled = COALESCE($9, endpoint_configs.webhook_enabled),
+            webhook_secret = COALESCE(endpoint_configs.webhook_secret, $8),
             is_active = TRUE
         """,
         request.endpoint_name,
@@ -715,21 +997,134 @@ async def register_endpoint(
         user_api_key,
         request.bot_token,
         request.admin_telegram_id,
-        request.channel_username
+        request.channel_username,
+        request.webhook_url,
+        webhook_secret,
+        bool(request.webhook_enabled and request.webhook_url),
     )
-    
+
+    row = await Database.fetchrow(
+        "SELECT webhook_secret FROM endpoint_configs WHERE endpoint_name = $1",
+        request.endpoint_name,
+    )
+
     return {
         "success": True,
         "endpoint": {
             "endpoint_name": request.endpoint_name,
             "admin_api_key": admin_api_key,
             "user_api_key": user_api_key,
-            "admin_telegram_id": request.admin_telegram_id,
-            "bot_token": request.bot_token,
-            "channel_username": request.channel_username
+            "webhook_url": request.webhook_url,
+            "webhook_secret": row['webhook_secret'],   # ✅ actual persisted value
+            "webhook_enabled": bool(request.webhook_enabled and request.webhook_url),
+            "note": (
+                "If webhook_secret was already set previously, this is the existing one. "
+                "Use POST /api/admin/webhook/config with rotate_secret=true to change it."
+            ),
         }
     }
+@app.post("/api/admin/webhook/config")
+async def update_webhook_config(
+    request: WebhookConfigUpdateRequest,
+    api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Update webhook URL / enable / rotate secret (admin only)."""
+    await rate_limit(api_key)
+    admin_data = await authenticate(api_key)
+    if not admin_data['is_admin']:
+        raise HTTPException(403, "Admin only")
+    endpoint_name = admin_data['endpoint_name']
 
+    new_secret = None
+    if request.rotate_secret:
+        new_secret = secrets.token_urlsafe(32)
+
+    await Database.execute(
+        """
+        UPDATE endpoint_configs
+        SET webhook_url = COALESCE($2, webhook_url),
+            webhook_enabled = COALESCE($3, webhook_enabled),
+            webhook_secret = COALESCE($4, webhook_secret)
+        WHERE endpoint_name = $1
+        """,
+        endpoint_name,
+        request.webhook_url,
+        request.webhook_enabled,
+        new_secret,
+    )
+
+    row = await Database.fetchrow(
+        """
+        SELECT webhook_url, webhook_enabled FROM endpoint_configs
+        WHERE endpoint_name = $1
+        """,
+        endpoint_name,
+    )
+    return {
+        "success": True,
+        "endpoint_name": endpoint_name,
+        "webhook_url": row['webhook_url'],
+        "webhook_enabled": row['webhook_enabled'],
+        "new_secret": new_secret,
+    }
+
+
+@app.post("/api/admin/webhook/test")
+async def test_webhook(
+    api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Send a test ping event to verify client's endpoint."""
+    await rate_limit(api_key)
+    admin_data = await authenticate(api_key)
+    if not admin_data['is_admin']:
+        raise HTTPException(403, "Admin only")
+    endpoint_name = admin_data['endpoint_name']
+
+    await fire_webhook(
+        endpoint_name=endpoint_name,
+        event_type="webhook.test",
+        payload={
+            "message": "This is a test event from marketplace server",
+            "ok": True,
+        },
+    )
+    return {"success": True, "message": "Test webhook queued"}
+
+
+@app.get("/api/admin/webhook/deliveries")
+async def list_webhook_deliveries(
+    status: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    api_key: str = Header(..., alias="X-API-Key"),
+):
+    """Delivery log (admin only)."""
+    await rate_limit(api_key)
+    admin_data = await authenticate(api_key)
+    if not admin_data['is_admin']:
+        raise HTTPException(403, "Admin only")
+    endpoint_name = admin_data['endpoint_name']
+
+    where = "WHERE endpoint_name = $1"
+    params: List[Any] = [endpoint_name]
+    if status:
+        params.append(status)
+        where += f" AND status = ${len(params)}"
+
+    rows = await Database.fetch(
+        f"""
+        SELECT delivery_id, event_type, transaction_id,
+               status, attempts, response_code,
+               last_error, created_at, delivered_at
+        FROM webhook_deliveries
+        {where}
+        ORDER BY created_at DESC
+        LIMIT ${len(params)+1} OFFSET ${len(params)+2}
+        """,
+        *params, limit, offset,
+    )
+    return {"success": True, "deliveries": [dict(r) for r in rows]}
+    
 # ============ Purchase Endpoints ============
 @app.post("/api/purchase/initiate")
 async def purchase_initiate(
@@ -738,91 +1133,154 @@ async def purchase_initiate(
 ):
     """
     🔥 NEW FLOW:
-    1. Check balance
-    2. Check stock  
-    3. DEDUCT BALANCE IMMEDIATELY
-    4. Reserve account
-    5. Send to OTP server
-    6. NO REFUND, NO CANCEL
+    - User sends their OWN user_api_key (not admin key)
+    - user_id / user_type / endpoint_name are derived from the API key
+    - Balance check → stock check → DEDUCT immediately → reserve → OTP server
+    - NO REFUND, NO CANCEL
     """
     await rate_limit(api_key)
-    
-    user_data = await authenticate(api_key, request.endpoint_name)
-    
-    if user_data['is_admin']:
+
+    # ✅ User auth (endpoint auto-derived from the key)
+    user_data = await authenticate_user(api_key)
+
+    user_identifier = user_data['user_id']
+    user_type       = user_data['user_type']
+    endpoint_name   = user_data['endpoint_name']
+
+    # 0. Admin guard (in case admin key leaks here)
+    if user_data.get('is_admin'):
         raise HTTPException(status_code=403, detail="Admin cannot purchase accounts")
-    
-    endpoint_name = user_data['endpoint_name']
-    
+
     # 1. Daily retry limit
-    daily_retries = await get_daily_retry_count(
-        request.user_identifier, request.user_type, endpoint_name
-    )
+    daily_retries = await get_daily_retry_count(user_identifier, user_type, endpoint_name)
     if daily_retries >= config.MAX_DAILY_RETRIES:
         raise HTTPException(
-            status_code=429, 
+            status_code=429,
             detail=f"Daily retry limit reached. Contact {config.ADMIN_CONTACT}"
         )
-    
-    # 2. Check balance (first check)
-    balance = await get_user_balance(
-        request.user_identifier, request.user_type, endpoint_name
-    )
+
+    # 2. Balance check
+    balance = await get_user_balance(user_identifier, user_type, endpoint_name)
     pricing = await get_pricing(request.country_code, request.spam_status, endpoint_name)
-    
+
     if balance < pricing['price']:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Insufficient balance. Required: {pricing['price']}, Available: {balance}"
         )
-    
-    # 3. Check stock availability
-    account = await reserve_account(
-        request.country_code, request.spam_status, endpoint_name
-    )
+
+    # 3. Stock check & reserve
+    account = await reserve_account(request.country_code, request.spam_status, endpoint_name)
     if not account:
         raise HTTPException(status_code=404, detail="Stock not found for requested criteria")
-    
+
     transaction = None
+
+    async def _rollback(reason: str, original_exc: Exception, is_http: bool):
+        """
+        Rollback handler:
+        - Release account ONLY if balance was NOT deducted
+        - If balance WAS deducted → mark tx as 'problem' for admin
+        - Always re-raise the appropriate exception (never swallow)
+        """
+        balance_was_deducted = False
+        if transaction:
+            tx_check = await Database.fetchrow(
+                "SELECT balance_deducted FROM transactions WHERE transaction_id = $1",
+                transaction['transaction_id']
+            )
+            balance_was_deducted = bool(tx_check and tx_check['balance_deducted'])
+
+        # Release account only if balance not taken
+        if account and not balance_was_deducted:
+            await Database.execute(
+                "UPDATE accounts SET status='available', reserved_at=NULL WHERE account_id=$1",
+                account['account_id']
+            )
+
+        # 🆕 If transaction was never created — just re-raise original
+        if not transaction:
+            if is_http:
+                raise original_exc
+            raise HTTPException(
+                status_code=500,
+                detail=f"⚠️ Server error. Contact admin {config.ADMIN_CONTACT}"
+            )
+
+        if balance_was_deducted:
+            # ⚠️ Balance gone → mark for admin, do NOT auto-refund
+            logger.critical(
+                "Balance deducted but flow failed | tx=%s | reason=%s | original=%r",
+                transaction['transaction_id'], reason, original_exc
+            )
+            await Database.execute(
+                """
+                UPDATE transactions
+                SET status='problem', lock_reason=$2, locked_at=NOW()
+                WHERE transaction_id=$1
+                """,
+                transaction['transaction_id'], reason
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"⚠️ Server error after balance deduction. "
+                    f"Contact admin {config.ADMIN_CONTACT} immediately. "
+                    f"Transaction ID: {transaction['transaction_id']}"
+                )
+            )
+        else:
+            # Balance safe → mark tx failed, re-raise original
+            await Database.execute(
+                """
+                UPDATE transactions
+                SET status='failed', lock_reason=$2
+                WHERE transaction_id=$1
+                """,
+                transaction['transaction_id'], reason
+            )
+            if is_http:
+                raise original_exc
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"⚠️ Server error. Contact admin {config.ADMIN_CONTACT} "
+                    f"with transaction ID: {transaction['transaction_id']}"
+                )
+            )
+
     try:
         # 4. Create transaction record FIRST
         purchase_code = uuid.uuid4().hex[:10].upper()
         transaction = await create_transaction(
-            request.user_identifier,
-            request.user_type,
-            account,
-            pricing['price'],
-            purchase_code,
-            endpoint_name
+            user_identifier, user_type, account,
+            pricing['price'], purchase_code, endpoint_name
         )
-        
-        # 🔥 5. DEDUCT BALANCE IMMEDIATELY (atomic)
+
+        # 5. DEDUCT balance immediately (atomic)
         await deduct_balance_immediately(
             transaction['transaction_id'],
-            request.user_identifier,
-            request.user_type,
-            endpoint_name,
+            user_identifier, user_type, endpoint_name,
             pricing['price']
         )
-        
+
         # 6. Send to OTP server
         otp_server = await get_available_otp_server()
         await send_to_otp_server(
-            otp_server,
-            account,
+            otp_server, account,
             transaction['transaction_id'],
             purchase_code,
             user_data['config'],
-            user_identifier=request.user_identifier,
-            user_type=request.user_type
+            user_identifier=user_identifier,
+            user_type=user_type
         )
-        
-        # Update last OTP request time
+
+        # 7. Mark last OTP request
         await Database.execute(
             "UPDATE transactions SET last_otp_request_at = NOW() WHERE transaction_id = $1",
             transaction['transaction_id']
         )
-        
+
         return {
             "success": True,
             "transaction_id": transaction['transaction_id'],
@@ -845,90 +1303,19 @@ async def purchase_initiate(
             "admin_contact": config.ADMIN_CONTACT,
             "note": "Balance has been deducted. No cancellation or refund available."
         }
-        
+
     except HTTPException as e:
-        # Re-check if balance was already deducted
-        balance_was_deducted = False
-        if transaction:
-            tx_check = await Database.fetchrow(
-                "SELECT balance_deducted FROM transactions WHERE transaction_id = $1",
-                transaction['transaction_id']
-            )
-            balance_was_deducted = tx_check and tx_check['balance_deducted']
-    
-        if account:
-            # Only release account if balance NOT deducted
-            if not balance_was_deducted:
-                await Database.execute(
-                    "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
-                    account['account_id']
-                )
-            # else: keep reserved, admin will handle
-    
-        if transaction:
-            if balance_was_deducted:
-                # ⚠️ Balance already gone — mark problem for admin
-                await Database.execute(
-                    """
-                    UPDATE transactions 
-                    SET status = 'problem',
-                        lock_reason = $2,
-                        locked_at = NOW()
-                    WHERE transaction_id = $1
-                    """,
-                    transaction['transaction_id'],
-                    f"OTP server error after deduction: {e.detail}"
-                )
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"⚠️ Server error after balance deduction. "
-                        f"Contact admin {config.ADMIN_CONTACT} immediately. "
-                        f"Transaction ID: {transaction['transaction_id']}"
-                    )
-                )
-            else:
-                await Database.execute(
-                    "UPDATE transactions SET status = 'failed', lock_reason = 'initiate_error' WHERE transaction_id = $1",
-                    transaction['transaction_id']
-                )
-        raise
-        
+        await _rollback(
+            f"OTP server error after deduction: {e.detail}",
+            original_exc=e,
+            is_http=True
+        )
+
     except Exception as e:
-        # Re-check balance deduction
-        balance_was_deducted = False
-        if transaction:
-            tx_check = await Database.fetchrow(
-                "SELECT balance_deducted FROM transactions WHERE transaction_id = $1",
-                transaction['transaction_id']
-            )
-            balance_was_deducted = tx_check and tx_check['balance_deducted']
-    
-        if account and not balance_was_deducted:
-            await Database.execute(
-                "UPDATE accounts SET status = 'available', reserved_at = NULL WHERE account_id = $1",
-                account['account_id']
-            )
-    
-        if transaction:
-            await Database.execute(
-                """
-                UPDATE transactions 
-                SET status = 'problem', 
-                    lock_reason = $2,
-                    locked_at = NOW()
-                WHERE transaction_id = $1
-                """,
-                transaction['transaction_id'],
-                f"Initiate error: {str(e)}"
-            )
-    
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"⚠️ Server error. Contact admin {config.ADMIN_CONTACT} with "
-                f"transaction ID: {transaction['transaction_id'] if transaction else 'N/A'}"
-            )
+        await _rollback(
+            f"Initiate error: {str(e)}",
+            original_exc=e,
+            is_http=False
         )
 
 @app.post("/api/purchase/request-otp")
@@ -957,7 +1344,19 @@ async def request_otp_again(
         raise HTTPException(status_code=404, detail="Transaction not found")
     
     endpoint_name = tx['endpoint_name']
-    user_data = await authenticate(api_key, endpoint_name)
+
+    # ✅ Dual-auth: per-user key vs admin key
+    if api_key.startswith("usr_"):
+        user_data = await authenticate_user(api_key)
+        if user_data['endpoint_name'] != endpoint_name:
+            raise HTTPException(403, "API key belongs to a different endpoint")
+        if (user_data['user_id'] != tx['user_id']
+                or user_data['user_type'] != tx['user_type']):
+            raise HTTPException(403, "You can only retry your own transactions")
+    else:
+        user_data = await authenticate(api_key, endpoint_name)
+        if not user_data['is_admin']:
+            raise HTTPException(403, "Admin API key required")
     
     # 🔴 Blocked statuses
     if tx['status'] in ('unauthorized', 'cancelled', 'failed', 'problem'):
@@ -1163,12 +1562,17 @@ async def otp_callback(
     
     tx = await Database.fetchrow(
         """
-        SELECT t.*, a.session_string 
+        SELECT t.*,
+               a.session_string, a.phone_number, a.two_fa_password,
+               a.first_name, a.last_name, a.username,
+               a.account_age_days, a.quality_score,
+               a.is_verified, a.is_business,
+               a.country_code AS acc_country, a.country_name
         FROM transactions t
         LEFT JOIN accounts a ON t.account_id = a.account_id
         WHERE t.transaction_id = $1
         """,
-        callback.transaction_id
+        callback.transaction_id,
     )
     
     if not tx:
@@ -1215,6 +1619,33 @@ async def otp_callback(
                 callback.transaction_id,
                 callback.otp_code
             )
+        # 🔔 Fire client webhook (otp.received)
+        await fire_webhook(
+            endpoint_name=tx['endpoint_name'],
+            event_type="otp.received",
+            transaction_id=str(tx['transaction_id']),
+            payload={
+                "purchase_code": tx['purchase_code'],
+                "phone_number": tx['phone_number'],
+                "otp_code": callback.otp_code,
+                "two_fa_password": tx['two_fa_password'],  # None হতে পারে
+                "buyer": {
+                    "id": tx['user_id'],
+                    "type": tx['user_type'],
+                },
+                "account": {
+                    "first_name": tx['first_name'],
+                    "last_name": tx['last_name'],
+                    "username": tx['username'],
+                    "account_age_days": tx['account_age_days'],
+                    "quality_score": tx['quality_score'],
+                    "is_verified": tx['is_verified'],
+                    "is_business": tx['is_business'],
+                    "country_code": tx['acc_country'],
+                    "country_name": tx['country_name'],
+                },
+            },
+        )
         
         return {
             "success": True,
@@ -1234,7 +1665,16 @@ async def otp_callback(
             """,
             callback.transaction_id
         )
-        
+        await fire_webhook(
+            endpoint_name=tx['endpoint_name'],
+            event_type="otp.timeout",
+            transaction_id=str(tx['transaction_id']),
+            payload={
+                "purchase_code": tx['purchase_code'],
+                "phone_number": tx['phone_number'],
+                "buyer": {"id": tx['user_id'], "type": tx['user_type']},
+            },
+        )
         # Account remains reserved — user can retry
         return {
             "success": True,
@@ -1267,7 +1707,17 @@ async def otp_callback(
             """,
             tx['account_id']
         )
-        
+        await fire_webhook(
+            endpoint_name=tx['endpoint_name'],
+            event_type="otp.unauthorized",
+            transaction_id=str(tx['transaction_id']),
+            payload={
+                "purchase_code": tx['purchase_code'],
+                "phone_number": tx['phone_number'],
+                "reason": callback.status,
+                "buyer": {"id": tx['user_id'], "type": tx['user_type']},
+            },
+        )
         return {
             "success": True,
             "message": (
@@ -1316,7 +1766,7 @@ async def add_single_account(
         bio, is_verified, is_business, last_active, quality_score
     )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-        ON CONFLICT (phone_number) 
+        ON CONFLICT (phone_number, endpoint_name) 
         DO UPDATE SET 
             country_code = $3,
             country_name = $4,
@@ -1409,7 +1859,7 @@ async def add_bulk_accounts(
                 bio, is_verified, is_business, last_active, quality_score
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-                ON CONFLICT (phone_number) 
+                ON CONFLICT (phone_number, endpoint_name) 
                 DO UPDATE SET 
                     country_code = $3,
                     country_name = $4,
@@ -1519,37 +1969,162 @@ async def set_country_pricing(
     
     return {"success": True, "message": f"Pricing updated for {pricing.country_code} in endpoint {endpoint_name}"}
 
+@app.post("/api/admin/users/register")
+async def register_user(
+    request: UserRegistrationRequest,
+    api_key: str = Header(..., alias="X-API-Key")
+):
+    """
+    🔑 Admin API key দিয়ে নতুন user register।
+    - endpoint_name admin key থেকেই পাওয়া যায়
+    - per-user unique API key জেনারেট হয় (usr_ prefix)
+    - same identifier দ্বিতীয়বার দিলে একই key ফেরত দেয় (idempotent)
+    """
+    await rate_limit(api_key)
+
+    admin_data = await authenticate(api_key)
+    if not admin_data['is_admin']:
+        raise HTTPException(status_code=403, detail="Admin API key required")
+
+    endpoint_name = admin_data['endpoint_name']
+
+    # Already registered? Return existing key (idempotent)
+    existing = await Database.fetchrow(
+        """
+        SELECT user_api_key, balance FROM users
+        WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $3
+        """,
+        request.user_identifier, request.user_type, endpoint_name
+    )
+
+    if existing:
+        existing_key = existing['user_api_key']
+
+        # 🆕 key না থাকলে এই মুহূর্তে generate করে save করি
+        if not existing_key:
+            existing_key = f"usr_{secrets.token_urlsafe(32)}"
+            await Database.execute(
+                """UPDATE users SET user_api_key=$1
+                   WHERE user_id=$2 AND user_type=$3 AND endpoint_name=$4""",
+                existing_key, request.user_identifier,
+                request.user_type, endpoint_name
+            )
+
+        return {
+            "success": True,
+            "already_registered": True,
+            "message": "User already exists — returning existing API key",
+            "user_id": request.user_identifier,
+            "user_type": request.user_type,
+            "endpoint_name": endpoint_name,
+            "user_api_key": existing_key,
+            "balance": float(existing['balance']),
+        }
+
+    # Generate unique per-user API key
+    user_api_key = f"usr_{secrets.token_urlsafe(32)}"
+
+    try:
+        await Database.execute(
+            """
+            INSERT INTO users (user_id, user_type, balance, endpoint_name, user_api_key)
+            VALUES ($1, $2, $3, $4, $5)
+            """,
+            request.user_identifier,
+            request.user_type,
+            float(request.initial_balance or 0.0),
+            endpoint_name,
+            user_api_key
+        )
+    except asyncpg.UniqueViolationError:
+        row = await Database.fetchrow(
+            """
+            SELECT user_api_key, balance FROM users
+            WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $3
+            """,
+            request.user_identifier, request.user_type, endpoint_name
+        )
+        key = row['user_api_key'] if row else None
+        if not key:
+            key = f"usr_{secrets.token_urlsafe(32)}"
+            await Database.execute(
+                """UPDATE users SET user_api_key=$1
+                   WHERE user_id=$2 AND user_type=$3 AND endpoint_name=$4""",
+                key, request.user_identifier, request.user_type, endpoint_name
+            )
+        return {
+            "success": True,
+            "already_registered": True,
+            "user_id": request.user_identifier,
+            "user_type": request.user_type,
+            "endpoint_name": endpoint_name,
+            "user_api_key": key,
+            "balance": float(row['balance']) if row else 0.0,
+        }
+    return {
+        "success": True,
+        "already_registered": False,
+        "message": "User registered successfully. Share this user_api_key with the user.",
+        "user_id": request.user_identifier,
+        "user_type": request.user_type,
+        "endpoint_name": endpoint_name,
+        "user_api_key": user_api_key,
+        "initial_balance": float(request.initial_balance or 0.0),
+    }
+    
 @app.post("/api/admin/users/balance")
 async def add_user_balance(
     request: BalanceRequest,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """Add user balance (admin only)"""
+    """Add user balance (admin only). ইউজার রেজিস্টার্ড থাকতে হবে।"""
     await rate_limit(api_key)
-    
-    user_data = await authenticate(api_key)
-    if not user_data['is_admin']:
+
+    admin_data = await authenticate(api_key)
+    if not admin_data['is_admin']:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
-    endpoint_name = user_data['endpoint_name']
-    
+
+    endpoint_name = admin_data['endpoint_name']
+
+    # ✅ STEP 1: user exist করে কিনা চেক
+    user_row = await Database.fetchrow(
+        """
+        SELECT user_api_key, balance FROM users
+        WHERE user_id = $1 AND user_type = $2 AND endpoint_name = $3
+        """,
+        request.user_id, request.user_type, endpoint_name
+    )
+
+    if not user_row:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"❌ User '{request.user_id}' ({request.user_type}) not registered "
+                f"in endpoint '{endpoint_name}'. "
+                f"Register first via POST /api/admin/users/register"
+            )
+        )
+
+    # ✅ STEP 2: balance add
     await Database.execute(
         """
-        INSERT INTO users (user_id, user_type, balance, endpoint_name)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (user_id, user_type, endpoint_name) 
-        DO UPDATE SET 
-            balance = users.balance + $3,
-            updated_at = CURRENT_TIMESTAMP
+        UPDATE users 
+        SET balance = balance + $1, updated_at = CURRENT_TIMESTAMP
+        WHERE user_id = $2 AND user_type = $3 AND endpoint_name = $4
         """,
-        request.user_id,
-        request.user_type,
-        request.amount,
-        endpoint_name
+        float(request.amount), request.user_id, request.user_type, endpoint_name
     )
-    
-    balance = await get_user_balance(request.user_id, request.user_type, endpoint_name)
-    return {"success": True, "user_id": request.user_id, "new_balance": balance}
+
+    new_balance = await get_user_balance(request.user_id, request.user_type, endpoint_name)
+    return {
+        "success": True,
+        "user_id": request.user_id,
+        "user_type": request.user_type,
+        "endpoint_name": endpoint_name,
+        "amount_added": float(request.amount),
+        "new_balance": new_balance,
+        "user_api_key": user_row['user_api_key'],
+    }
 
 @app.get("/api/admin/accounts/list")
 async def list_accounts(
@@ -1612,8 +2187,6 @@ async def list_accounts(
     accounts = []
     for row in rows:
         account = dict(row)
-        if not user_data['is_admin']:
-            account['phone_number'] = hide_phone(account['phone_number'])
         accounts.append(account)
     return {
         "success": True,
@@ -1797,68 +2370,55 @@ async def view_transactions(
 # ============ User Endpoints (Endpoint-aware) ============
 @app.post("/api/user/balance")
 async def check_user_balance(
-    request: UserBalanceRequest,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """Check user balance (user or admin)"""
+    """নিজের balance চেক — শুধু API key পাঠান।"""
     await rate_limit(api_key)
-    
-    # Need endpoint; we can infer from API key if user, but if admin, we also need endpoint.
-    # We'll attempt to authenticate without explicit endpoint; if it's admin, we might need to specify endpoint in request? 
-    # Better: require endpoint in request? But user might not know endpoint name. 
-    # For simplicity, we keep as is: authenticate and use the endpoint from the key.
-    # However, if a user key is used, it belongs to exactly one endpoint, so we can derive it.
-    # If an admin key is used, we also derive one endpoint; that's fine for admin checking their own users.
-    user_data = await authenticate(api_key)
-    endpoint_name = user_data['endpoint_name']
-    
-    balance = await get_user_balance(request.user_id, request.user_type, endpoint_name)
+
+    user_data = await authenticate_user(api_key)
+    balance = await get_user_balance(
+        user_data['user_id'], user_data['user_type'], user_data['endpoint_name']
+    )
+
     return {
         "success": True,
-        "user_id": request.user_id,
-        "user_type": request.user_type,
-        "endpoint_name": endpoint_name,
+        "user_id": user_data['user_id'],
+        "user_type": user_data['user_type'],
+        "endpoint_name": user_data['endpoint_name'],
         "balance": balance
     }
 
 @app.get("/api/stock")
-async def get_available_stock(
-    api_key: str = Header(..., alias="X-API-Key")
-):
-    """Get available stock (public for any authenticated user)"""
+async def get_available_stock(api_key: str = Header(..., alias="X-API-Key")):
     await rate_limit(api_key)
-    
-    user_data = await authenticate(api_key)
+
+    user_data = await authenticate_user(api_key)
     endpoint_name = user_data['endpoint_name']
-    
+
     results = await Database.fetch(
         """
-        SELECT 
-            a.country_code,
-            a.country_name,
-            a.spam_status,
-            cp.base_price,
-            cp.limited_price,
-            COUNT(*) as available_count
+        SELECT a.country_code, a.country_name, a.spam_status,
+               cp.base_price, cp.limited_price,
+               COUNT(*) as available_count
         FROM accounts a
-        LEFT JOIN country_pricing cp ON a.country_code = cp.country_code AND a.endpoint_name = cp.endpoint_name
+        LEFT JOIN country_pricing cp 
+            ON a.country_code = cp.country_code AND a.endpoint_name = cp.endpoint_name
         WHERE a.status = 'available' AND a.endpoint_name = $1
-        GROUP BY a.country_code, a.country_name, a.spam_status, cp.base_price, cp.limited_price
+        GROUP BY a.country_code, a.country_name, a.spam_status,
+                 cp.base_price, cp.limited_price
         ORDER BY a.country_code, a.spam_status
         """,
         endpoint_name
     )
-    
-    stock = []
-    for row in results:
-        stock.append({
-            "country_code": row['country_code'],
-            "country_name": row['country_name'],
-            "spam_status": row['spam_status'],
-            "price": float(row['limited_price'] if row['spam_status'] == 'limited' else row['base_price']),
-            "available_count": row['available_count']
-        })
-    
+
+    stock = [{
+        "country_code": r['country_code'],
+        "country_name": r['country_name'],
+        "spam_status": r['spam_status'],
+        "price": float(r['limited_price'] if r['spam_status'] == 'limited' else r['base_price']),
+        "available_count": r['available_count'],
+    } for r in results]
+
     return {"success": True, "stock": stock}
 
 # ============ Database Initialization ============
@@ -1989,6 +2549,52 @@ async def init_database():
         ADD COLUMN IF NOT EXISTS locked_at TIMESTAMP,
         ADD COLUMN IF NOT EXISTS lock_reason TEXT
     """)
+    
+    # 🆕 Endpoint webhook config
+    await Database.execute("""
+        ALTER TABLE endpoint_configs 
+        ADD COLUMN IF NOT EXISTS webhook_url VARCHAR(500),
+        ADD COLUMN IF NOT EXISTS webhook_secret VARCHAR(255),
+        ADD COLUMN IF NOT EXISTS webhook_enabled BOOLEAN DEFAULT FALSE
+    """)
+
+    # 🆕 Webhook delivery log (retry queue)
+    await Database.execute("""
+        CREATE TABLE IF NOT EXISTS webhook_deliveries (
+            id SERIAL PRIMARY KEY,
+            delivery_id UUID NOT NULL DEFAULT gen_random_uuid(),
+            endpoint_name VARCHAR(255) NOT NULL,
+            event_type VARCHAR(50) NOT NULL,
+            transaction_id UUID,
+            webhook_url VARCHAR(500) NOT NULL,
+            payload JSONB NOT NULL,
+            status VARCHAR(20) DEFAULT 'pending',
+            attempts INTEGER DEFAULT 0,
+            last_attempt_at TIMESTAMP,
+            last_error TEXT,
+            response_code INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            delivered_at TIMESTAMP
+        )
+    """)
+    await Database.execute("""
+        CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_endpoint 
+        ON webhook_deliveries(endpoint_name, created_at DESC)
+    """)
+    await Database.execute("""
+        CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_status 
+        ON webhook_deliveries(status) WHERE status != 'delivered'
+    """)
+    # 🆕 Migration: users.user_api_key + unique index
+    await Database.execute("""
+        ALTER TABLE users 
+        ADD COLUMN IF NOT EXISTS user_api_key VARCHAR(255)
+    """)
+    await Database.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_api_key 
+        ON users(user_api_key) 
+        WHERE user_api_key IS NOT NULL
+    """)
     # Indexes for performance
     await Database.execute("CREATE INDEX IF NOT EXISTS idx_accounts_endpoint_status ON accounts(endpoint_name, status)")
     await Database.execute("CREATE INDEX IF NOT EXISTS idx_accounts_endpoint_country_status ON accounts(endpoint_name, country_code, spam_status, status)")
@@ -2005,19 +2611,23 @@ async def init_database():
         VALUES ('default', 'admin_key_123', 'user_key_123', NULL, NULL, NULL)
         ON CONFLICT (endpoint_name) DO NOTHING
     """)
-    
-    # Insert default user for default endpoint
-    await Database.execute("""
-        INSERT INTO users (user_id, user_type, balance, endpoint_name)
-        VALUES ('test_user', 'api', 100.00, 'default')
-        ON CONFLICT (user_id, user_type, endpoint_name) DO NOTHING
-    """)
 
+    # 🆕 FIX: phone_number শুধু নিজের endpoint-এ unique
+    await Database.execute("""
+        ALTER TABLE accounts 
+        DROP CONSTRAINT IF EXISTS accounts_phone_number_key
+    """)
+    await Database.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_phone_endpoint 
+        ON accounts(phone_number, endpoint_name)
+    """)
+    
 # ============ Startup/Shutdown Events ============
 @app.on_event("startup")
 async def startup_event():
     await init_database()
     asyncio.create_task(cleanup_expired_transactions())
+    asyncio.create_task(retry_stuck_webhooks())
     print("🚀 Main Marketplace Server started successfully with Endpoint System!")
     print(f"📍 Database connected: {config.DATABASE_URL}")
     print(f"🔑 OTP Servers: {len(config.OTP_SERVERS)} configured")
@@ -2028,6 +2638,8 @@ async def startup_event():
     print(f"📞 Admin contact: {config.ADMIN_CONTACT}")
     print(f"🔄 Daily Retry Limit: {config.MAX_DAILY_RETRIES} per user per endpoint")
     print(f"🏢 Endpoint System: Enabled (each endpoint isolated)")
+    print(f"🔐 User Registration: POST /api/admin/users/register")
+    print(f"🎫 Per-User API Keys: Enabled (usr_ prefix)")
 
 @app.on_event("shutdown")
 async def shutdown_event():
