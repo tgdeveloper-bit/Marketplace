@@ -100,12 +100,27 @@ class EndpointRegistrationRequest(BaseModel):
     admin_telegram_id: int
     bot_token: str
     channel_username: str
+    verify_key: str = Field(
+        ..., min_length=16, max_length=255,
+        description="Trusted verify key for direct purchase API (X-Verify-Key header)"
+    )
     webhook_url: Optional[str] = Field(
         None, description="Per-endpoint webhook URL (https://...)"
     )
     webhook_enabled: Optional[bool] = False
 
+class DirectPurchaseInitiateRequest(BaseModel):
+    user_identifier: str = Field(..., min_length=1, max_length=255)
+    user_type: str = Field(..., min_length=1, max_length=50)
+    country_code: str = Field(..., min_length=2, max_length=2)
+    spam_status: str = Field(..., pattern="^(good|limited|bad)$")
 
+class DirectRetryOTPRequest(BaseModel):
+    transaction_id: str
+    purchase_code: str
+    user_identifier: str
+    user_type: str
+    
 class WebhookConfigUpdateRequest(BaseModel):
     webhook_url: Optional[str] = None       # None দিলে ক্লিয়ার হবে না
     webhook_enabled: Optional[bool] = None
@@ -113,6 +128,7 @@ class WebhookConfigUpdateRequest(BaseModel):
     
 class EndpointConfigCreateRequest(BaseModel):
     endpoint_name: str
+    verify_key: Optional [int] = None
     admin_api_key: str
     user_api_key: Optional[str] = None
     bot_token: Optional[str] = None
@@ -580,6 +596,36 @@ async def authenticate_user(user_api_key: str) -> Dict[str, Any]:
         },
     }
     
+async def authenticate_verify_key(verify_key: str) -> Dict[str, Any]:
+    """
+    Super-admin-issued verify key দিয়ে trusted client verify করে।
+    এই flow-এ কোন user/balance concept নেই — শুধু endpoint verify হয়।
+    """
+    if not verify_key:
+        raise HTTPException(status_code=401, detail="Missing X-Verify-Key header")
+
+    result = await Database.fetchrow(
+        """
+        SELECT * FROM endpoint_configs
+        WHERE verify_key = $1 AND is_active = TRUE
+        """,
+        verify_key,
+    )
+    if not result:
+        raise HTTPException(status_code=401, detail="Invalid or inactive verify key")
+
+    return {
+        "is_admin": False,
+        "is_trusted": True,
+        "endpoint_name": result['endpoint_name'],
+        "config": {
+            "endpoint_name": result['endpoint_name'],
+            "bot_token": result['bot_token'],
+            "admin_telegram_id": result['admin_telegram_id'],
+            "channel_username": result['channel_username'],
+        },
+    }
+    
 async def get_user_balance(user_id: str, user_type: str, endpoint_name: str) -> float:
     """Get user balance for a specific endpoint"""
     result = await Database.fetchrow(
@@ -662,7 +708,7 @@ async def auto_release_account(account_id: str):
     if active_tx:
         # 🛡️ Balance already deducted — DO NOT release
         # Account will be released only when OTP detected or 24h auto-lock kicks in
-        print(f"⏸️ Skipping auto-release: account {account_id} has active paid transaction")
+        logger.info(f"⏸️ Skipping auto-release: account {account_id} has active paid transaction")
         return
     
     # Safe to release — no money involved
@@ -924,7 +970,7 @@ async def cleanup_expired_transactions():
                 """
             )
         except Exception as e:
-            print(f"Cleanup error: {e}")
+            logger.warning("Cleanup error: %s", e)
         
         await asyncio.sleep(config.CLEANUP_INTERVAL)
 # ============ Rate Limiting ============
@@ -978,8 +1024,8 @@ async def register_endpoint(
         INSERT INTO endpoint_configs 
         (endpoint_name, admin_api_key, user_api_key, bot_token,
          admin_telegram_id, channel_username,
-         webhook_url, webhook_secret, webhook_enabled)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         webhook_url, webhook_secret, webhook_enabled, verify_key)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (endpoint_name) 
         DO UPDATE SET 
             admin_api_key = $2,
@@ -990,6 +1036,7 @@ async def register_endpoint(
             webhook_url = COALESCE($7, endpoint_configs.webhook_url),
             webhook_enabled = COALESCE($9, endpoint_configs.webhook_enabled),
             webhook_secret = COALESCE(endpoint_configs.webhook_secret, $8),
+            verify_key = $10,
             is_active = TRUE
         """,
         request.endpoint_name,
@@ -1001,6 +1048,7 @@ async def register_endpoint(
         request.webhook_url,
         webhook_secret,
         bool(request.webhook_enabled and request.webhook_url),
+        request.verify_key,
     )
 
     row = await Database.fetchrow(
@@ -1014,6 +1062,7 @@ async def register_endpoint(
             "endpoint_name": request.endpoint_name,
             "admin_api_key": admin_api_key,
             "user_api_key": user_api_key,
+            "verify_key": request.verify_key,
             "webhook_url": request.webhook_url,
             "webhook_secret": row['webhook_secret'],   # ✅ actual persisted value
             "webhook_enabled": bool(request.webhook_enabled and request.webhook_url),
@@ -1312,6 +1361,7 @@ async def purchase_initiate(
         )
 
     except Exception as e:
+        logger.exception("Purchase initiate failed")
         await _rollback(
             f"Initiate error: {str(e)}",
             original_exc=e,
@@ -1405,21 +1455,34 @@ async def request_otp_again(
         )
     
     # Get or reserve account
-    account = await Database.fetchrow(
-        "SELECT * FROM accounts WHERE account_id = $1 AND status IN ('available', 'reserved')",
-        tx['account_id']
-    )
-    
-    if not account:
-        account = await reserve_account(tx['country_code'], tx['spam_status'], endpoint_name)
-        if not account:
-            raise HTTPException(status_code=404, detail="No stock available")
-        
-        await Database.execute(
-            "UPDATE transactions SET account_id = $1 WHERE transaction_id = $2",
-            account['account_id'],
-            request.transaction_id
+    if otp_detected_before:
+        # 🛡️ After OTP detected — NEVER switch accounts.
+        # Just re-use the same account (even if 'sold').
+        account = await Database.fetchrow(
+            "SELECT * FROM accounts WHERE account_id = $1",
+            tx['account_id']
         )
+        if not account:
+            raise HTTPException(
+                status_code=400,
+                detail="Original account no longer exists. Contact admin."
+            )
+    else:
+        # Before detection — allow re-use or new reservation
+        account = await Database.fetchrow(
+            "SELECT * FROM accounts WHERE account_id = $1 AND status IN ('available', 'reserved')",
+            tx['account_id']
+        )
+        if not account:
+            account = await reserve_account(tx['country_code'], tx['spam_status'], endpoint_name)
+            if not account:
+                raise HTTPException(status_code=404, detail="No stock available")
+
+            await Database.execute(
+                "UPDATE transactions SET account_id = $1 WHERE transaction_id = $2",
+                account['account_id'],
+                request.transaction_id
+            )
     
     # Update counters
     await Database.execute(
@@ -1434,6 +1497,17 @@ async def request_otp_again(
         request.transaction_id
     )
     
+    # 🆕 Kill any previous OTP session for this transaction
+    for srv in config.OTP_SERVERS:
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.delete(
+                    f"{srv}/api/otp/session/{request.transaction_id}",
+                    headers={"X-Internal-Key": config.INTERNAL_API_KEY},
+                    timeout=5.0,
+                )
+        except Exception:
+            pass  # session didn't exist — fine
     # Send to OTP server
     otp_server = await get_available_otp_server()
     try:
@@ -1542,6 +1616,290 @@ async def cancel_reservation(
         "message": "Transaction cancelled by admin. (Balance refund is manual.)"
     }
 
+# ============ NEW: Direct / Trusted Purchase (No Balance) ============
+@app.post("/api/direct/purchase/initiate")
+async def direct_purchase_initiate(
+    request: DirectPurchaseInitiateRequest,
+    verify_key: str = Header(..., alias="X-Verify-Key"),
+):
+    """
+    🔥 DIRECT/TRUSTED FLOW (bot/web থেকে আসা request):
+    - Super-admin-issued verify_key দিয়ে auth (কোন user_api_key লাগে না)
+    - ❌ কোন balance check নেই, ❌ deduction নেই, ❌ refund নেই
+    - ✅ বাকি সব একই: daily limit, reservation, OTP server, callback, webhook
+    """
+    await rate_limit(f"direct:{verify_key}:{request.user_identifier}")
+
+    client = await authenticate_verify_key(verify_key)
+    endpoint_name = client['endpoint_name']
+
+    # Daily retry limit (per user per endpoint — same config)
+    daily_retries = await get_daily_retry_count(
+        request.user_identifier, request.user_type, endpoint_name
+    )
+    if daily_retries >= config.MAX_DAILY_RETRIES:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Daily retry limit reached. Contact {config.ADMIN_CONTACT}",
+        )
+
+    # Pricing — শুধু response-এ দেখানোর জন্য, deduct হবে না
+    pricing = await get_pricing(
+        request.country_code, request.spam_status, endpoint_name
+    )
+
+    # Reserve account
+    account = await reserve_account(
+        request.country_code, request.spam_status, endpoint_name
+    )
+    if not account:
+        raise HTTPException(status_code=404, detail="Stock not found for requested criteria")
+
+    transaction = None
+    try:
+        purchase_code = uuid.uuid4().hex[:10].upper()
+        transaction = await create_transaction(
+            request.user_identifier, request.user_type, account,
+            pricing['price'], purchase_code, endpoint_name,
+        )
+
+        # 🛡️ Trusted flow — auto-release বন্ধ করতে committed flag সেট
+        # (balance_deducted semantically "committed" বোঝায় এখানে)
+        await Database.execute(
+            "UPDATE transactions SET balance_deducted = TRUE WHERE transaction_id = $1",
+            transaction['transaction_id'],
+        )
+
+        otp_server = await get_available_otp_server()
+        await send_to_otp_server(
+            otp_server, account,
+            transaction['transaction_id'],
+            purchase_code,
+            client['config'],
+            user_identifier=request.user_identifier,
+            user_type=request.user_type,
+        )
+
+        await Database.execute(
+            "UPDATE transactions SET last_otp_request_at = NOW() WHERE transaction_id = $1",
+            transaction['transaction_id'],
+        )
+
+        return {
+            "success": True,
+            "trusted": True,
+            "balance_checked": False,
+            "transaction_id": transaction['transaction_id'],
+            "purchase_code": purchase_code,
+            "phone_number": account['phone_number'],
+            "first_name": account.get('first_name'),
+            "last_name": account.get('last_name'),
+            "username": account.get('username'),
+            "account_age_days": account.get('account_age_days'),
+            "is_verified": account.get('is_verified', False),
+            "is_business": account.get('is_business', False),
+            "quality_score": account.get('quality_score'),
+            "price": pricing['price'],              # display only
+            "two_fa_password": account.get('two_fa_password'),
+            "otp_timeout": config.OTP_TIMEOUT,
+            "endpoint_channel_username": client['config'].get('channel_username'),
+            "daily_retries_remaining": config.MAX_DAILY_RETRIES - daily_retries,
+            "admin_contact": config.ADMIN_CONTACT,
+        }
+
+    except HTTPException as e:
+        if transaction is None and account:
+            await Database.execute(
+                "UPDATE accounts SET status='available', reserved_at=NULL WHERE account_id=$1",
+                account['account_id'],
+            )
+        elif transaction:
+            # transaction committed কিন্তু OTP server fail → problem mark
+            await Database.execute(
+                """
+                UPDATE transactions 
+                SET status='problem', lock_reason=$2, locked_at=NOW()
+                WHERE transaction_id=$1
+                """,
+                transaction['transaction_id'], f"Direct initiate HTTP error: {e.detail}",
+            )
+        raise
+
+    except Exception as e:
+        logger.error("Direct initiate error: %s", e)
+        if transaction:
+            await Database.execute(
+                """
+                UPDATE transactions 
+                SET status='problem', lock_reason=$2, locked_at=NOW()
+                WHERE transaction_id=$1
+                """,
+                transaction['transaction_id'], f"Direct initiate error: {str(e)}",
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"⚠️ Server error. Contact admin {config.ADMIN_CONTACT}",
+        )
+
+
+@app.post("/api/direct/purchase/request-otp")
+async def direct_request_otp(
+    request: DirectRetryOTPRequest,
+    verify_key: str = Header(..., alias="X-Verify-Key"),
+):
+    """
+    🔥 Direct flow-এর OTP retry। 
+    - verify_key + tx ownership (user_identifier/user_type match) দিয়ে auth
+    - কোন balance ছোঁয়া হয় না
+    """
+    await rate_limit(f"direct:{verify_key}:{request.user_identifier}")
+
+    client = await authenticate_verify_key(verify_key)
+    endpoint_name = client['endpoint_name']
+
+    tx = await Database.fetchrow(
+        """
+        SELECT * FROM transactions 
+        WHERE transaction_id = $1 AND purchase_code = $2 AND endpoint_name = $3
+        """,
+        request.transaction_id, request.purchase_code, endpoint_name,
+    )
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    # Ownership check — same user ছাড়া retry করতে পারবে না
+    if tx['user_id'] != request.user_identifier or tx['user_type'] != request.user_type:
+        raise HTTPException(status_code=403, detail="You can only retry your own transactions")
+
+    # Blocked statuses
+    if tx['status'] in ('unauthorized', 'cancelled', 'failed', 'problem'):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot retry. Transaction is {tx['status']}. Contact {config.ADMIN_CONTACT}",
+        )
+
+    await check_otp_cooldown(request.transaction_id)
+
+    otp_detected_before = tx['otp_detected_count'] > 0
+
+    if otp_detected_before:
+        await strict_rate_limit(tx['user_id'], endpoint_name)
+        if tx['otp_retry_count'] >= config.MAX_OTP_RETRIES_AFTER_DETECTION:
+            await Database.execute(
+                """
+                UPDATE transactions 
+                SET status='locked', locked_at=NOW(),
+                    lock_reason='max_retries_after_detection_exceeded'
+                WHERE transaction_id = $1
+                """,
+                request.transaction_id,
+            )
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"🚫 LOCKED: Max retries after OTP detection exceeded "
+                    f"({config.MAX_OTP_RETRIES_AFTER_DETECTION}). "
+                    f"Contact admin {config.ADMIN_CONTACT}."
+                ),
+            )
+
+    if not otp_detected_before and tx['otp_attempts'] >= config.MAX_OTP_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Max OTP attempts reached. Contact {config.ADMIN_CONTACT}",
+        )
+
+    # Account handling (same as existing flow)
+    if otp_detected_before:
+        account = await Database.fetchrow(
+            "SELECT * FROM accounts WHERE account_id = $1", tx['account_id']
+        )
+        if not account:
+            raise HTTPException(400, detail="Original account no longer exists. Contact admin.")
+    else:
+        account = await Database.fetchrow(
+            "SELECT * FROM accounts WHERE account_id = $1 AND status IN ('available','reserved')",
+            tx['account_id'],
+        )
+        if not account:
+            account = await reserve_account(
+                tx['country_code'], tx['spam_status'], endpoint_name
+            )
+            if not account:
+                raise HTTPException(404, detail="No stock available")
+            await Database.execute(
+                "UPDATE transactions SET account_id = $1 WHERE transaction_id = $2",
+                account['account_id'], request.transaction_id,
+            )
+
+    await Database.execute(
+        """
+        UPDATE transactions 
+        SET otp_attempts = otp_attempts + 1,
+            otp_retry_count = otp_retry_count + 1,
+            last_otp_request_at = NOW(),
+            otp_status = 'none'
+        WHERE transaction_id = $1
+        """,
+        request.transaction_id,
+    )
+
+    # Kill previous OTP sessions
+    for srv in config.OTP_SERVERS:
+        try:
+            async with httpx.AsyncClient() as http_client:
+                await http_client.delete(
+                    f"{srv}/api/otp/session/{request.transaction_id}",
+                    headers={"X-Internal-Key": config.INTERNAL_API_KEY},
+                    timeout=5.0,
+                )
+        except Exception:
+            pass
+
+    otp_server = await get_available_otp_server()
+    try:
+        await send_to_otp_server(
+            otp_server, account,
+            request.transaction_id, tx['purchase_code'],
+            client['config'],
+            user_identifier=tx['user_id'], user_type=tx['user_type'],
+        )
+    except HTTPException as e:
+        await Database.execute(
+            """
+            UPDATE transactions 
+            SET status='problem', lock_reason=$2, locked_at=NOW()
+            WHERE transaction_id = $1
+            """,
+            request.transaction_id, f"Direct OTP retry failed: {e.detail}",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"⚠️ OTP retry failed. Contact admin {config.ADMIN_CONTACT}. "
+                   f"Transaction: {request.transaction_id}",
+        )
+
+    if otp_detected_before:
+        remaining = config.MAX_OTP_RETRIES_AFTER_DETECTION - (tx['otp_retry_count'] + 1)
+        return {
+            "success": True,
+            "trusted": True,
+            "strict_mode": True,
+            "strict_retries_remaining": max(0, remaining),
+            "cooldown_seconds": config.OTP_RETRY_COOLDOWN_SECONDS,
+            "warning": "Repeated requests after OTP detection may lock the account.",
+        }
+    else:
+        return {
+            "success": True,
+            "trusted": True,
+            "strict_mode": False,
+            "attempts_remaining": config.MAX_OTP_ATTEMPTS - (tx['otp_attempts'] + 1),
+            "cooldown_seconds": config.OTP_RETRY_COOLDOWN_SECONDS,
+            "daily_retries_remaining": config.MAX_DAILY_RETRIES - await get_daily_retry_count(
+                tx['user_id'], tx['user_type'], endpoint_name
+            ),
+        }
 # ============ Internal Endpoints ============
 @app.post("/api/otp/callback")
 async def otp_callback(
@@ -1582,7 +1940,8 @@ async def otp_callback(
     
     # ============ OTP DETECTED ============
     if callback.status == "detected":
-        async with Database.pool.acquire() as conn:
+        pool = await Database.connect()
+        async with pool.acquire() as conn:
             async with conn.transaction():
                 # Increment detection counter
                 await conn.execute(
@@ -2621,6 +2980,15 @@ async def init_database():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_accounts_phone_endpoint 
         ON accounts(phone_number, endpoint_name)
     """)
+    await Database.execute("""
+        ALTER TABLE endpoint_configs 
+        ADD COLUMN IF NOT EXISTS verify_key VARCHAR(255)
+    """)
+    await Database.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoint_verify_key 
+        ON endpoint_configs(verify_key) 
+        WHERE verify_key IS NOT NULL
+    """)
     
 # ============ Startup/Shutdown Events ============
 @app.on_event("startup")
@@ -2640,6 +3008,7 @@ async def startup_event():
     print(f"🏢 Endpoint System: Enabled (each endpoint isolated)")
     print(f"🔐 User Registration: POST /api/admin/users/register")
     print(f"🎫 Per-User API Keys: Enabled (usr_ prefix)")
+    print(f"🆕 Direct/Trusted Purchase: POST /api/direct/purchase/initiate (X-Verify-Key)")
 
 @app.on_event("shutdown")
 async def shutdown_event():
