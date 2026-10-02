@@ -2560,54 +2560,62 @@ async def view_stock(
     spam_status: Optional[str] = None,
     api_key: str = Header(..., alias="X-API-Key")
 ):
-    """View stock (admin only)"""
     await rate_limit(api_key)
-    
     user_data = await authenticate(api_key)
     if not user_data['is_admin']:
         raise HTTPException(status_code=403, detail="Admin access required")
-    
+
     endpoint_name = user_data['endpoint_name']
-    
+
     query = """
-        SELECT country_code, country_name, spam_status, status, COUNT(*) as count
-        FROM accounts
-        WHERE endpoint_name = $1
+        SELECT a.country_code, a.country_name,
+               MAX(a.prefix) AS prefix,
+               a.spam_status, a.status, COUNT(*) as count
+        FROM accounts a
+        WHERE a.endpoint_name = $1
     """
     params = [endpoint_name]
-    
+
     if country_code:
         params.append(country_code)
-        query += f" AND country_code = ${len(params)}"
-    
+        query += f" AND a.country_code = ${len(params)}"
     if spam_status:
         params.append(spam_status)
-        query += f" AND spam_status = ${len(params)}"
-    
-    query += " GROUP BY country_code, country_name, spam_status, status ORDER BY country_code, spam_status, status"
-    
+        query += f" AND a.spam_status = ${len(params)}"
+
+    query += (" GROUP BY a.country_code, a.country_name, a.spam_status, a.status"
+              " ORDER BY a.country_code, a.spam_status, a.status")
+
     results = await Database.fetch(query, *params)
-    
+
+    # Fetch prices for all countries in this endpoint
+    pricing_rows = await Database.fetch(
+        "SELECT country_code, base_price, limited_price "
+        "FROM country_pricing WHERE endpoint_name = $1",
+        endpoint_name,
+    )
+    pmap = {r['country_code']: r for r in pricing_rows}
+
     stock_summary = {}
     for row in results:
         key = f"{row['country_code']}_{row['spam_status']}"
         if key not in stock_summary:
+            p = pmap.get(row['country_code'])
             stock_summary[key] = {
-                "country_code": row['country_code'],
-                "country_name": row['country_name'],
-                "spam_status": row['spam_status'],
-                "available": 0,
-                "reserved": 0,
-                "sold": 0,
-                "pending_takeover": 0,
-                "total": 0
+                "country_code":  row['country_code'],
+                "country_name":  row['country_name'],
+                "prefix":        row['prefix'],
+                "spam_status":   row['spam_status'],
+                "base_price":    float(p['base_price'])    if p else 0.0,
+                "limited_price": float(p['limited_price']) if p else 0.0,
+                "available": 0, "reserved": 0,
+                "sold": 0, "pending_takeover": 0, "total": 0,
             }
-        
         status = row['status']
         if status in stock_summary[key]:
             stock_summary[key][status] = row['count']
         stock_summary[key]['total'] += row['count']
-    
+
     return {"success": True, "stock": list(stock_summary.values())}
 
 @app.get("/api/admin/transaction/{transaction_id}")
@@ -2988,6 +2996,10 @@ async def init_database():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoint_verify_key 
         ON endpoint_configs(verify_key) 
         WHERE verify_key IS NOT NULL
+    """)
+    await Database.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_otp_requests_transaction
+        ON otp_requests(transaction_id)
     """)
     
 # ============ Startup/Shutdown Events ============
