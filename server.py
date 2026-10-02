@@ -2567,57 +2567,80 @@ async def view_stock(
 
     endpoint_name = user_data['endpoint_name']
 
-    query = """
-        SELECT a.country_code, a.country_name,
-               MAX(a.prefix) AS prefix,
-               a.spam_status, a.status, COUNT(*) as count
-        FROM accounts a
-        WHERE a.endpoint_name = $1
-    """
-    params = [endpoint_name]
-
-    if country_code:
-        params.append(country_code)
-        query += f" AND a.country_code = ${len(params)}"
-    if spam_status:
-        params.append(spam_status)
-        query += f" AND a.spam_status = ${len(params)}"
-
-    query += (" GROUP BY a.country_code, a.country_name, a.spam_status, a.status"
-              " ORDER BY a.country_code, a.spam_status, a.status")
-
-    results = await Database.fetch(query, *params)
-
-    # Fetch prices for all countries in this endpoint
+    # 1) All configured countries (pricing table) — this drives the list
     pricing_rows = await Database.fetch(
-        "SELECT country_code, base_price, limited_price "
-        "FROM country_pricing WHERE endpoint_name = $1",
+        """
+        SELECT country_code, country_name, prefix, base_price, limited_price
+        FROM country_pricing
+        WHERE endpoint_name = $1
+        ORDER BY country_code
+        """,
         endpoint_name,
     )
-    pmap = {r['country_code']: r for r in pricing_rows}
 
-    stock_summary = {}
-    for row in results:
-        key = f"{row['country_code']}_{row['spam_status']}"
-        if key not in stock_summary:
-            p = pmap.get(row['country_code'])
-            stock_summary[key] = {
-                "country_code":  row['country_code'],
-                "country_name":  row['country_name'],
-                "prefix":        row['prefix'],
-                "spam_status":   row['spam_status'],
-                "base_price":    float(p['base_price'])    if p else 0.0,
-                "limited_price": float(p['limited_price']) if p else 0.0,
-                "available": 0, "reserved": 0,
-                "sold": 0, "pending_takeover": 0, "total": 0,
+    if not pricing_rows:
+        return {"success": True, "stock": []}
+
+    # 2) Stock counts from accounts (only for countries with inventory)
+    count_rows = await Database.fetch(
+        """
+        SELECT country_code, spam_status, status, COUNT(*) AS cnt
+        FROM accounts
+        WHERE endpoint_name = $1
+        GROUP BY country_code, spam_status, status
+        """,
+        endpoint_name,
+    )
+
+    # Bucket: {(CC, status): {"available": n, "reserved": n, "sold": n, ...}}
+    counts: dict = {}
+    for r in count_rows:
+        key = (r['country_code'], r['spam_status'])
+        if key not in counts:
+            counts[key] = {"available": 0, "reserved": 0, "sold": 0,
+                           "pending_takeover": 0}
+        st = r['status']
+        if st in counts[key]:
+            counts[key][st] = int(r['cnt'])
+
+    # 3) Build one row per (country, good|limited)
+    #    - good    → uses base_price
+    #    - limited → uses limited_price
+    #    - bad     → skipped (no price configured for bad)
+    stock_summary = []
+    for p in pricing_rows:
+        cc  = p['country_code']
+        for status, price_key in (("good", "base_price"), ("limited", "limited_price")):
+            c = counts.get((cc, status), {})
+            available = c.get("available", 0)
+            reserved  = c.get("reserved", 0)
+            sold      = c.get("sold", 0)
+            total     = available + reserved + sold
+
+            row = {
+                "country_code":  cc,
+                "country_name":  p['country_name'],
+                "prefix":        p['prefix'],
+                "spam_status":   status,
+                "base_price":    float(p['base_price']),
+                "limited_price": float(p['limited_price']),
+                "price":         float(p[price_key]),   # convenience
+                "available":     available,
+                "reserved":      reserved,
+                "sold":          sold,
+                "pending_takeover": 0,
+                "total":         total,
             }
-        status = row['status']
-        if status in stock_summary[key]:
-            stock_summary[key][status] = row['count']
-        stock_summary[key]['total'] += row['count']
 
-    return {"success": True, "stock": list(stock_summary.values())}
+            if country_code and cc.upper() != country_code.upper():
+                continue
+            if spam_status and status != spam_status.lower():
+                continue
 
+            stock_summary.append(row)
+
+    return {"success": True, "stock": stock_summary}
+    
 @app.get("/api/admin/transaction/{transaction_id}")
 async def get_transaction_details(
     transaction_id: str,
